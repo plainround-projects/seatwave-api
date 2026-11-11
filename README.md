@@ -258,6 +258,10 @@ src/main/java/io/plainround/seatwave/api/
 src/test/java/ the tests, one folder per package; contract/ also holds the lint and diff tools
 ```
 
+## Technology notes
+
+The `tech/` folder explains every technology this repository uses, from zero: Java, HTTP and the JDK server, JSON with Jackson, logging, H2 with SQL and migrations, the OpenAPI contract, the contract validator and diff tools, Gradle and its wrapper scripts, Bash and the retry script, the version catalog, dependency locking, the formatter, the coverage tool, the test libraries, properties files, Docker Compose, EditorConfig and Git. Ten more files walk through the main code and the tests line by line. Start at `tech/README.md`, which gives a reading order.
+
 ## What is simplified for teaching
 
 - No authentication: idempotency keys are scoped to the endpoint, not to the caller. A production API scopes them to the authenticated client (Module 38), so one client cannot read another's stored reply.
