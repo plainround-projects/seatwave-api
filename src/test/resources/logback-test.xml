@@ -1,0 +1,16 @@
+<configuration>
+  <!-- Tests print only warnings and errors, so the build output stays readable. -->
+  <appender name="console" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} %-5level [%X{correlationId:-none}] %logger{0} - %msg%n</pattern>
+    </encoder>
+  </appender>
+  <!-- The OpenAPI parser reports a broken reference both as a message (which the lint prints) and
+       as an ERROR log with a stack trace; the message is enough. The schema validator warns about
+       OpenAPI keywords it does not know, which are not JSON Schema keywords. -->
+  <logger name="io.swagger.v3.parser" level="OFF"/>
+  <logger name="com.networknt.schema" level="ERROR"/>
+  <root level="WARN">
+    <appender-ref ref="console"/>
+  </root>
+</configuration>

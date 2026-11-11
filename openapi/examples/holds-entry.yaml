@@ -1,0 +1,90 @@
+# Lab 1 (easy), the solution: the contract entry for POST /v1/holds alone, with its success,
+# conflict and error responses. Check it with: ./gradlew -q lintContract --args='openapi/examples/holds-entry.yaml'
+openapi: 3.1.2
+info:
+  title: SeatWave holds (Lab 1)
+  version: 1.0.0
+paths:
+  /v1/holds:
+    post:
+      operationId: holdSeat
+      summary: Hold one seat for 300 seconds.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: An RFC 9651 String, new for each user action, kept for 24 hours.
+          schema:
+            type: string
+            pattern: '^"[A-Za-z0-9_-]{1,64}"$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [eventId, seat, customer]
+              properties:
+                eventId:
+                  type: integer
+                  format: int64
+                  minimum: 1
+                seat:
+                  type: string
+                  pattern: '^[A-T]-[1-9][0-9]{0,3}$'
+                customer:
+                  type: string
+                  pattern: '^[A-Za-z0-9_-]{1,64}$'
+      responses:
+        '201':
+          description: Held. A retry with the same key gets this same hold.
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [holdId, eventId, seat, state, expiresAt]
+                properties:
+                  holdId:
+                    type: string
+                  eventId:
+                    type: integer
+                  seat:
+                    type: string
+                  state:
+                    type: string
+                    enum: [held]
+                  expiresAt:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '422':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Problem'
+components:
+  responses:
+    Problem:
+      description: RFC 9457 problem details.
+      content:
+        application/problem+json:
+          schema:
+            type: object
+            required: [type, title, status]
+            properties:
+              type:
+                type: string
+                format: uri-reference
+              title:
+                type: string
+              status:
+                type: integer
+              detail:
+                type: string

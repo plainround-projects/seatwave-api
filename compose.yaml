@@ -1,0 +1,18 @@
+# Optional: a second, independent linter for the contract, in a container. The build's own check
+# (the Java parser, the house rules and the contract tests) needs no container; this adds Redocly's
+# rule set for readers who have Docker. The tag and its digest were checked on Docker Hub on
+# 11 November 2026 (Redocly CLI 2.77.0, pushed 9 November 2026). It reads the repository's
+# openapi/ folder read-only, opens no port and needs no network once the image is pulled.
+# Run it with: docker compose run --rm lint
+services:
+  lint:
+    image: redocly/cli:2.77.0@sha256:9f2213a2765ce9de36484ac2825bcf255c17db66e7b47909f8fbf189aba06b41
+    command: ["lint", "/spec/seatwave-api.yaml"]
+    volumes:
+      - ./openapi:/spec:ro
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

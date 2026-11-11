@@ -1,0 +1,736 @@
+openapi: 3.1.2
+info:
+  title: SeatWave booking API
+  version: 1.1.0
+  summary: List events, page through seats, and hold, confirm and cancel seats, safely retried.
+  description: |
+    The contract between SeatWave and every client. It is the source of truth: the build fails
+    when this document is invalid and when the running service answers with anything it does not
+    describe.
+
+    Rules that hold for every operation:
+    - Every error, in version 1, is a problem details body (RFC 9457) of media type
+      application/problem+json.
+    - Collections are paginated with an opaque cursor; the largest page is 500 items.
+    - POST /v1/holds and POST /v1/bookings require an Idempotency-Key header (an RFC 9651
+      String, as the IETF draft draft-ietf-httpapi-idempotency-key-header asks). A retry with the
+      same key and the same body gets the first response again and does nothing new. The same key
+      with a different body gets 422. A retry while the first request is still running gets 409.
+      A key is kept for 24 hours after its first use; after that the key is forgotten and a request
+      that reuses it is treated as new.
+    - Changes inside version 1 are additive only: new operations, new optional request fields,
+      new response fields. Clients must ignore response fields they do not know.
+    - The unversioned paths of SeatWave version 0 (Module 1) still answer, unchanged, and are
+      marked deprecated. Every reply on them carries Deprecation, Sunset and Link headers.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: http://127.0.0.1:8087
+    description: The lab server; it binds to the loopback address only.
+tags:
+  - name: catalog
+    description: Events and their seats.
+  - name: booking
+    description: Holds and bookings.
+  - name: operations
+    description: Health and metrics for the people who run SeatWave.
+  - name: version-0
+    description: The Module 1 paths, kept for old clients until their sunset date.
+paths:
+  /v1/events:
+    get:
+      tags: [catalog]
+      operationId: listEvents
+      summary: List events, soonest first, one page at a time.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of events. nextCursor is absent on the last page.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/events/{eventId}/seats:
+    get:
+      tags: [catalog]
+      operationId: listSeats
+      summary: List one event's seats in seat-map order, one page at a time.
+      description: |
+        The order is section, then seat number, and it never changes, so a cursor can name the
+        last seat a client has seen. Seats held or sold after a page was read keep their place:
+        paging neither skips nor repeats a seat. A cursor is bound to the filters it was made
+        with; using it with other filters is a 400.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - name: section
+          in: query
+          description: Only seats in this section.
+          schema:
+            type: string
+            pattern: '^[A-T]$'
+        - name: state
+          in: query
+          description: Only seats in this state.
+          schema:
+            $ref: '#/components/schemas/SeatState'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of seats. nextCursor is absent on the last page.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/holds:
+    post:
+      tags: [booking]
+      operationId: holdSeat
+      summary: Hold one seat for 300 seconds.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HoldRequest'
+      responses:
+        '201':
+          description: The seat is held. A retry with the same key returns this same hold.
+          headers:
+            Location:
+              description: The new hold, /v1/holds/{holdId}.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Hold'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/TooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/KeyReused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/holds/{holdId}:
+    get:
+      tags: [booking]
+      operationId: getHold
+      summary: Read a hold and its state.
+      parameters:
+        - $ref: '#/components/parameters/HoldId'
+      responses:
+        '200':
+          description: The hold.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Hold'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    delete:
+      tags: [booking]
+      operationId: cancelHold
+      summary: Release a hold. Idempotent by design, so it needs no key.
+      description: |
+        Cancelling a hold that is already cancelled or expired answers 204 again: the seat ends
+        in the same state however many times the request arrives. A hold that became a booking
+        cannot be cancelled here (409).
+      parameters:
+        - $ref: '#/components/parameters/HoldId'
+      responses:
+        '204':
+          description: The hold is released (now or earlier).
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/bookings:
+    post:
+      tags: [booking]
+      operationId: confirmBooking
+      summary: Pay for a held seat and turn the hold into a booking.
+      description: |
+        The payment is taken through the payment provider with a provider key made from the hold,
+        so one hold can be charged at most once, whatever the client retries and even after this
+        API has forgotten the client's Idempotency-Key. If the provider times out or fails, the
+        answer is 503 and nothing is stored under the key, so the client retries with the same key.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BookingRequest'
+      responses:
+        '201':
+          description: The seat is paid for and booked. A retry with the same key returns this booking.
+          headers:
+            Location:
+              description: The new booking, /v1/bookings/{bookingId}.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/TooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/KeyReused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/bookings/{bookingId}:
+    get:
+      tags: [booking]
+      operationId: getBooking
+      summary: Read a booking.
+      parameters:
+        - name: bookingId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: The booking.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /health:
+    get:
+      tags: [operations]
+      operationId: health
+      summary: Is this process able to answer?
+      responses:
+        '200':
+          description: The process and its database answer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /metrics:
+    get:
+      tags: [operations]
+      operationId: metrics
+      summary: Counters and latency histograms in the Prometheus text format.
+      responses:
+        '200':
+          description: The metrics.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /events:
+    get:
+      tags: [version-0]
+      operationId: listEventsVersion0
+      deprecated: true
+      summary: Module 1's event list, unpaginated, epoch milliseconds.
+      responses:
+        '200':
+          description: Every event.
+          headers:
+            Deprecation:
+              $ref: '#/components/headers/Deprecation'
+            Sunset:
+              $ref: '#/components/headers/Sunset'
+            Link:
+              $ref: '#/components/headers/SuccessorLink'
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/EventVersion0'
+        '503':
+          $ref: '#/components/responses/UnavailableVersion0'
+  /events/{eventId}/seats:
+    get:
+      tags: [version-0]
+      operationId: listSeatsVersion0
+      deprecated: true
+      summary: Module 1's seat list for one section, at most 1,000 seats.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - name: section
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-T]$'
+      responses:
+        '200':
+          description: The section's seats.
+          headers:
+            Deprecation:
+              $ref: '#/components/headers/Deprecation'
+            Sunset:
+              $ref: '#/components/headers/Sunset'
+            Link:
+              $ref: '#/components/headers/SuccessorLink'
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 1000
+                items:
+                  $ref: '#/components/schemas/SeatVersion0'
+        '400':
+          $ref: '#/components/responses/BadRequestVersion0'
+        '503':
+          $ref: '#/components/responses/UnavailableVersion0'
+  /holds:
+    post:
+      tags: [version-0]
+      operationId: holdSeatVersion0
+      deprecated: true
+      summary: Module 1's hold, a form body and no idempotency key, so a retry after a lost reply gets 409 for its own hold.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [eventId, seat, customer]
+              properties:
+                eventId:
+                  type: string
+                seat:
+                  type: string
+                customer:
+                  type: string
+      responses:
+        '201':
+          description: The seat is held.
+          headers:
+            Deprecation:
+              $ref: '#/components/headers/Deprecation'
+            Sunset:
+              $ref: '#/components/headers/Sunset'
+            Link:
+              $ref: '#/components/headers/SuccessorLink'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HoldVersion0'
+        '400':
+          $ref: '#/components/responses/BadRequestVersion0'
+        '409':
+          $ref: '#/components/responses/ConflictVersion0'
+        '413':
+          $ref: '#/components/responses/BadRequestVersion0'
+        '503':
+          $ref: '#/components/responses/UnavailableVersion0'
+  /bookings:
+    post:
+      tags: [version-0]
+      operationId: confirmBookingVersion0
+      deprecated: true
+      summary: Module 1's confirm, a form body; since Module 2 it takes the payment too.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [holdId]
+              properties:
+                holdId:
+                  type: string
+      responses:
+        '201':
+          description: The seat is booked.
+          headers:
+            Deprecation:
+              $ref: '#/components/headers/Deprecation'
+            Sunset:
+              $ref: '#/components/headers/Sunset'
+            Link:
+              $ref: '#/components/headers/SuccessorLink'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingVersion0'
+        '400':
+          $ref: '#/components/responses/BadRequestVersion0'
+        '409':
+          $ref: '#/components/responses/ConflictVersion0'
+        '413':
+          $ref: '#/components/responses/BadRequestVersion0'
+        '503':
+          $ref: '#/components/responses/UnavailableVersion0'
+components:
+  parameters:
+    EventId:
+      name: eventId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    HoldId:
+      name: holdId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    Limit:
+      name: limit
+      in: query
+      description: Items per page, from 1 to 500. Without it, 100.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 100
+    Cursor:
+      name: cursor
+      in: query
+      description: The nextCursor of the previous page, unchanged. Opaque to clients.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-]{1,200}$'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        A String in the RFC 9651 syntax, so written with double quotes, for example
+        "8e03978e-40d5-43e8-bc93-6894a57f9324". Inside the quotes: 1 to 64 letters, digits,
+        hyphens or underscores. A random UUID per user action is the recommended choice.
+      schema:
+        type: string
+        pattern: '^"[A-Za-z0-9_-]{1,64}"$'
+  headers:
+    Deprecation:
+      description: When this path was deprecated, an RFC 9745 date, for example @1798761600.
+      schema:
+        type: string
+        pattern: '^@[0-9]+$'
+    Sunset:
+      description: When this path stops answering, an RFC 8594 HTTP date.
+      schema:
+        type: string
+    SuccessorLink:
+      description: The version 1 replacement, as an RFC 8288 link with rel="successor-version".
+      schema:
+        type: string
+  responses:
+    BadRequest:
+      description: The request breaks the contract (a field, a header, a cursor); errors names each one.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: No such event, seat, hold or booking.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: |
+        The request is valid but the state does not allow it: the seat is taken, the hold expired
+        or was cancelled or became a booking, or a request with the same Idempotency-Key is still
+        running. The type tells which.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooLarge:
+      description: The body is over 1,024 bytes.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnsupportedMediaType:
+      description: The body is not application/json.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    KeyReused:
+      description: This Idempotency-Key was already used with a different body.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unavailable:
+      description: Busy, the database is unreachable, or the payment provider did not answer. Retry after Retry-After seconds, with the same Idempotency-Key.
+      headers:
+        Retry-After:
+          description: Seconds to wait before a retry.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    BadRequestVersion0:
+      description: Module 1's error body.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorVersion0'
+    ConflictVersion0:
+      description: Module 1's error body.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorVersion0'
+    UnavailableVersion0:
+      description: Module 1's error body.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorVersion0'
+  schemas:
+    Uuid:
+      type: string
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    SeatLabel:
+      type: string
+      description: Section letter, a hyphen, then the seat number, for example A-7.
+      pattern: '^[A-T]-[1-9][0-9]{0,3}$'
+    SeatState:
+      type: string
+      enum: [available, held, sold]
+    Event:
+      type: object
+      required: [eventId, name, startsAt]
+      properties:
+        eventId:
+          type: integer
+          format: int64
+        name:
+          type: string
+        startsAt:
+          type: string
+          format: date-time
+    EventPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/Event'
+        nextCursor:
+          type: string
+    Seat:
+      type: object
+      required: [seat, section, status]
+      properties:
+        seat:
+          $ref: '#/components/schemas/SeatLabel'
+        section:
+          type: string
+          pattern: '^[A-T]$'
+        status:
+          $ref: '#/components/schemas/SeatState'
+    SeatPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/Seat'
+        nextCursor:
+          type: string
+    HoldRequest:
+      type: object
+      additionalProperties: false
+      required: [eventId, seat, customer, channel]
+      properties:
+        eventId:
+          type: integer
+          format: int64
+          minimum: 1
+        seat:
+          $ref: '#/components/schemas/SeatLabel'
+        customer:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{1,64}$'
+        channel:
+          type: string
+          enum: [web, app, partner]
+    Hold:
+      type: object
+      required: [holdId, eventId, seat, state, expiresAt]
+      properties:
+        holdId:
+          $ref: '#/components/schemas/Uuid'
+        eventId:
+          type: integer
+          format: int64
+        seat:
+          $ref: '#/components/schemas/SeatLabel'
+        state:
+          type: string
+          enum: [held, confirming, confirmed, cancelled, expired]
+        expiresAt:
+          type: string
+          format: date-time
+    BookingRequest:
+      type: object
+      additionalProperties: false
+      required: [holdId]
+      properties:
+        holdId:
+          $ref: '#/components/schemas/Uuid'
+    Booking:
+      type: object
+      required: [bookingId, holdId, eventId, seat, paymentId, amount, currency, confirmedAt]
+      properties:
+        bookingId:
+          $ref: '#/components/schemas/Uuid'
+        holdId:
+          $ref: '#/components/schemas/Uuid'
+        eventId:
+          type: integer
+          format: int64
+        seat:
+          $ref: '#/components/schemas/SeatLabel'
+        paymentId:
+          type: string
+        amount:
+          type: string
+          description: A decimal amount with two digits after the point, for example 80.00.
+          pattern: '^[0-9]+\.[0-9]{2}$'
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+        confirmedAt:
+          type: string
+          format: date-time
+    Problem:
+      type: object
+      description: RFC 9457 problem details. Clients act on type and status; title and detail are for people.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
+        errors:
+          type: array
+          description: One entry per field that broke the contract.
+          items:
+            type: object
+            required: [pointer, detail]
+            properties:
+              pointer:
+                type: string
+                description: A JSON pointer into the body, or the name of a header or a query parameter.
+              detail:
+                type: string
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [up]
+    EventVersion0:
+      type: object
+      required: [eventId, name, startsAt]
+      properties:
+        eventId:
+          type: integer
+        name:
+          type: string
+        startsAt:
+          type: integer
+          description: Epoch milliseconds.
+    SeatVersion0:
+      type: object
+      required: [seat, state]
+      properties:
+        seat:
+          type: string
+        state:
+          $ref: '#/components/schemas/SeatState'
+    HoldVersion0:
+      type: object
+      required: [holdId, expiresInSeconds]
+      properties:
+        holdId:
+          type: string
+        expiresInSeconds:
+          type: integer
+    BookingVersion0:
+      type: object
+      required: [bookingId]
+      properties:
+        bookingId:
+          type: string
+    ErrorVersion0:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
