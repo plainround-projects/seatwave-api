@@ -5,6 +5,7 @@ import java.io.Reader;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
@@ -46,15 +47,30 @@ public final class SettingsReader {
    *
    * @param path the file
    * @return the loaded properties
-   * @throws IOException if the file cannot be read
+   * @throws IOException if the file does not exist or cannot be read; the message says which
    */
   public static Properties load(Path path) throws IOException {
     Objects.requireNonNull(path, "path");
     Properties properties = new Properties();
     try (Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
       properties.load(reader);
+    } catch (NoSuchFileException missing) {
+      // The JDK's message is the bare path, which does not tell a reader what is wrong with it.
+      throw new IOException("the settings file " + path + " does not exist", missing);
+    } catch (IOException unreadable) {
+      throw new IOException(
+          "the settings file " + path + " cannot be read: " + unreadable.getMessage(), unreadable);
     }
     return properties;
+  }
+
+  /**
+   * Records a problem that involves more than one key, so it is reported with the others.
+   *
+   * @param problem the problem line, naming the keys
+   */
+  public void reject(String problem) {
+    problems.add(Objects.requireNonNull(problem, "problem"));
   }
 
   /**

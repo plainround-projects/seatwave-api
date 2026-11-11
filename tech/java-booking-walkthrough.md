@@ -885,7 +885,7 @@ public final class HoldService {
 - `keys.claim(connection, claim, now)` is the first statement of the transaction. It tries to insert the key row. The `switch` handles the four answers with **record patterns**: `case ClaimResult.Replay(StoredReply reply)` matches a `Replay` and puts its field in a variable named `reply`.
 - `Replay`: a finished request with the same key and body exists. `connection.rollback()` ends the transaction at once (nothing to keep), and the method returns a success with `Source.REPLAY`.
 - `BodyMismatch`: the key was used with another body. Rollback, and return the error `KeyReusedWithOtherBody`.
-- `Claimed()` or `Resumed()` (written as two patterns with a comma): this request owns the key. The block holds only a comment, so the code falls out of the `switch` and goes on. For a hold, `Resumed` should not happen, because a hold claims and completes its key in one transaction and so never leaves an unfinished row behind.
+- `Claimed()` or `Resumed()` (written as two patterns with a comma): this request owns the key. The block holds only a comment, so the code falls out of the `switch` and goes on. For a hold, `Resumed` should not happen, because a hold claims and completes its key in one transaction and so never leaves an unfinished row behind. (Two requests with the same expired key once produced it here, and the `complete` below then failed; `IdempotencyStore.claim` now takes an expired key over in one conditional update and gives the loser the winner's reply.)
 
 ```java
         StoredReply reply = render.apply(holdOnce(connection, command, now));

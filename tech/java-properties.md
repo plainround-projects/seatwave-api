@@ -75,7 +75,7 @@ Both comment lines gave no key. `h` kept its `# not`. `d` is 2. `long` joined it
 
 When a value is bad the reader records the problem and returns a harmless stand-in (the minimum, zero, the epoch), so reading goes on and every other problem is found in the same run. The caller must look at `problems()` before using any value.
 
-`ApiSettings.from` then builds the settings record. If a rule between two keys fails, the record's constructor throws and `from` returns that one message. The two cross-key rules: the lease must be longer than the connect and request timeouts together, and `version0.sunsetAt` must be after `version0.deprecatedAt`. These are reported **one at a time**: I set both wrong and only the lease line was printed.
+`ApiSettings.from` also checks the two rules between keys: the lease must be longer than the connect and request timeouts together, and `version0.sunsetAt` must be after `version0.deprecatedAt`. Each is checked only when its keys were valid alone, and its line joins the same list as every other problem, so all of them appear in one run. I set both wrong and both lines were printed. The records' constructors check the same rules again, as a last line of defence for code that builds them directly.
 
 I broke `serve.properties` four ways in a scratch copy (port 80, no `seed.sections`, a provider on `example.com`, a price of `80`):
 
@@ -294,7 +294,7 @@ Gradle then prints `finished with non-zero exit value 2`.
 invalid: payment.leaseMillis must be longer than the connect and request timeouts together
 ```
 
-If you also set `version0.sunsetAt=2026-01-01T00:00:00Z`, only the lease line appears: the cross-key rules are reported one at a time.
+If you also set `version0.sunsetAt=2026-01-01T00:00:00Z`, a second line `invalid: version0.sunsetAt must be after version0.deprecatedAt` appears in the same run.
 
 **4. See the old-path headers change with the dates.** Start the server with a copy of `serve.properties` (a free port, `mem:` database, a short `serve.seconds`) and run:
 

@@ -51,7 +51,8 @@ claim(connection, claim, now)
   insert the row (state IN_PROGRESS) ........................ ok -> Claimed
   insert fails with "duplicate" ............................. read the existing row
       row gone (the other transaction rolled back) .......... insert once more
-      row expired (expires_at <= now) ....................... delete it, insert once more
+      row expired (expires_at <= now) ....................... take it over -> Claimed,
+                                                               or read what the winner left
       row has another fingerprint ........................... BodyMismatch (422)
       row is COMPLETED ...................................... Replay (the stored reply)
       row is IN_PROGRESS .................................... Resumed
@@ -67,9 +68,9 @@ claim(connection, claim, now)
 - The transaction committed and only the reply was lost on the way. The row is `COMPLETED`. The retry gets `Replay` and the stored reply, byte for byte. The README shows four retries of one hold returning the identical text.
 - The process died before the commit. The database rolled back both the seat change and the key row. The retry finds no row, becomes the owner, and does the work once. This is why the key row and the effect must be in the same transaction. If they were in two transactions, a crash between them would leave either a seat held with no key (the retry would try to hold again and get "seat taken") or a key with no seat (the retry would be told it worked when it did not).
 
-**An expired key.** Every row has `expires_at`: its creation time plus 24 hours. When a claim finds a duplicate whose `expires_at` is now or earlier, it deletes the old row and inserts a new one. The request is new, "whatever the old one did". A job also deletes expired rows in batches (`purgeExpired`, run once a minute by `SeatWaveApi`), so the table does not grow without limit; the index `idempotency_keys_by_expiry` makes that fast.
+**An expired key.** Every row has `expires_at`: its creation time plus 24 hours. When a claim finds a duplicate whose `expires_at` is now or earlier, it takes the row over with one conditional `UPDATE` that writes the new fingerprint, `IN_PROGRESS` and a new expiry. The request is new, "whatever the old one did". A job also deletes expired rows in batches (`purgeExpired`, run once a minute by `SeatWaveApi`), so the table does not grow without limit; the index `idempotency_keys_by_expiry` makes that fast.
 
-One narrow edge exists. If two requests present the same expired key at the very same moment, both read the old expired row. The first deletes it and inserts a new one. The second then finds its own delete matched nothing and its insert fails again, so `claim` returns `Resumed` for it. I replayed that sequence in plain SQL on H2 2.5.252 and saw `B deleted 0 row(s), insert failed 23505`. A `Resumed` request goes on as if it owned the key. For a hold, its `complete` call would then match no `IN_PROGRESS` row and the service would throw. It needs a key older than 24 hours used twice in one instant, so ordinary traffic does not meet it. I report it with the other findings.
+**Two requests with the same expired key at the same moment.** Both read the old expired row. Both send the take-over `UPDATE`, whose condition `expires_at <= now` is checked again by the database under the row's lock. The first takes the lock and changes the row. The second waits for that lock. When the first commits, the database checks the second one's condition again on the new row, which is no longer expired, so the second `UPDATE` changes nothing. The second request then reads the row the first one left and is treated like any other retry: the same body and `COMPLETED` gives `Replay`, a different body gives `BodyMismatch`. If the first rolls back instead, the row is expired again and the second takes it over. Exactly one request does the work. (An earlier version deleted the expired row and inserted a new one in two steps; the second request then got `Resumed` with nothing to complete, and a hold ended in an internal error. `IdempotencyStoreTest` forces that interleaving and checks the second request now gets the first one's reply.)
 
 ## Walkthrough of this repository's use
 
@@ -401,41 +402,26 @@ public final class IdempotencyStore {
 
 ```java
         if (row.getLong("expires_at") <= now.toEpochMilli()) {
-          // An expired key is forgotten: this request is new, whatever the old one did.
-          forget(connection, claim);
-          return tryInsert(connection, claim, now)
+          // An expired key is forgotten: this request is new, whatever the old one did. The take
+          // over is one conditional UPDATE, so of two requests with the same expired key exactly
+          // one wins; the other waits for its row lock and then finds the key alive again.
+          return takeOverExpired(connection, claim, now)
               ? new ClaimResult.Claimed()
-              : new ClaimResult.Resumed();
+              : resultOfLiveKey(connection, claim);
         }
 ```
 
-- Expiry check. `row.getLong("expires_at") <= now.toEpochMilli()` compares two numbers: epoch milliseconds. If the key has expired, `forget` deletes it, the insert is tried again, and the result is `Claimed`. The comment says it plainly: an expired key is forgotten, and this request is new whatever the old one did. (The narrow race on this path is described above.)
+- Expiry check. `row.getLong("expires_at") <= now.toEpochMilli()` compares two numbers: epoch milliseconds. If the key has expired, `takeOverExpired` tries to take the row over. If it did, the result is `Claimed`. If it did not, another request took it over first, and `resultOfLiveKey` reads what that request left. The comment says it plainly: an expired key is forgotten, this request is new whatever the old one did, and of two requests with the same expired key exactly one wins.
 - The expiry check comes before the fingerprint check on purpose. A body that differs from an expired key's body is not a mistake.
 
 ```java
-        if (!row.getString("fingerprint").equals(claim.fingerprint().hex())) {
-          return new ClaimResult.BodyMismatch();
-        }
-```
-
-- `row.getString("fingerprint").equals(claim.fingerprint().hex())`: if the stored fingerprint differs from this request's, the answer is `BodyMismatch`. Nothing is written.
-
-```java
-        if (COMPLETED.equals(row.getString("state"))) {
-          return new ClaimResult.Replay(
-              new StoredReply(
-                  row.getInt("response_status"),
-                  row.getString("response_location"),
-                  row.getString("response_body")));
-        }
-        return new ClaimResult.Resumed();
+        return resultOf(row, claim);
       }
     }
   }
 ```
 
-- If the stored state is `COMPLETED`, the code builds a `StoredReply` from the three response columns and returns `Replay`. `COMPLETED.equals(...)` is written with the constant first, which cannot fail on a null.
-- Anything else is a row that is `IN_PROGRESS` with the same fingerprint: `Resumed`.
+- A key that has not expired is judged by `resultOf`, shown with the helpers below.
 
 #### `complete`
 
@@ -568,22 +554,73 @@ public final class IdempotencyStore {
 - The `catch` turns exactly one error into a return value: SQLSTATE `23505`, "the row already exists", becomes `false`. Any other `SQLException` (a lock timeout, a full disk) is rethrown. This is how the code uses the database's refusal as its decision.
 - The comment is a warning for other databases. H2 undoes only the failed statement and keeps the transaction usable. PostgreSQL aborts the whole transaction after a failed statement, so there this insert would have to run inside a savepoint (a partial rollback point).
 
-#### `forget`
+#### `takeOverExpired`, `resultOfLiveKey` and `resultOf`
 
 ```java
-  private static void forget(Connection connection, KeyClaim claim) throws SQLException {
-    try (PreparedStatement delete =
+  private static boolean takeOverExpired(Connection connection, KeyClaim claim, Instant now)
+      throws SQLException {
+    try (PreparedStatement update =
         connection.prepareStatement(
-            "DELETE FROM idempotency_keys WHERE endpoint = ? AND idempotency_key = ?")) {
-      delete.setString(1, claim.endpoint());
-      delete.setString(2, claim.key().value());
-      delete.executeUpdate();
+            "UPDATE idempotency_keys SET fingerprint = ?, state = ?, response_status = NULL,"
+                + " response_location = NULL, response_body = NULL, created_at = ?, expires_at = ?"
+                + " WHERE endpoint = ? AND idempotency_key = ? AND expires_at <= ?")) {
+      update.setString(1, claim.fingerprint().hex());
+      update.setString(2, IN_PROGRESS);
+      update.setLong(3, now.toEpochMilli());
+      update.setLong(4, now.plus(ContractLimits.KEY_RETENTION).toEpochMilli());
+      update.setString(5, claim.endpoint());
+      update.setString(6, claim.key().value());
+      // The expiry is checked again here, under the row lock, not only in the read before it.
+      update.setLong(7, now.toEpochMilli());
+      return update.executeUpdate() == 1;
     }
+  }
+```
+
+- `takeOverExpired` rewrites the expired row for this request in one statement: the new fingerprint, the state `IN_PROGRESS`, the three response columns emptied with `NULL`, a new creation time and a new expiry 24 hours on. The `WHERE` names the row by its primary key and adds `expires_at <= ?`. The comment says why that last condition matters: the database checks it again after it has the row's lock, so a request that waited for another's take over sees the row as it is now, alive, and changes nothing. `executeUpdate() == 1` is true when this request won.
+
+```java
+  private static ClaimResult resultOfLiveKey(Connection connection, KeyClaim claim)
+      throws SQLException {
+    try (PreparedStatement query =
+        connection.prepareStatement(
+            "SELECT fingerprint, state, response_status, response_location, response_body"
+                + " FROM idempotency_keys WHERE endpoint = ? AND idempotency_key = ?")) {
+      query.setString(1, claim.endpoint());
+      query.setString(2, claim.key().value());
+      try (ResultSet row = query.executeQuery()) {
+        // The winner of the take over committed its row; a purge cannot remove a live key.
+        if (!row.next()) {
+          throw new IllegalStateException("a key taken over by another request disappeared");
+        }
+        return resultOf(row, claim);
+      }
+    }
+  }
+```
+
+- `resultOfLiveKey` reads the row again after a lost take over. The row must be there: the winner committed it with a fresh expiry, and the purge removes only expired rows, so a missing row would be a bug and is thrown as one (the comment says so). Otherwise it hands the row to `resultOf`.
+
+```java
+  private static ClaimResult resultOf(ResultSet row, KeyClaim claim) throws SQLException {
+    if (!row.getString("fingerprint").equals(claim.fingerprint().hex())) {
+      return new ClaimResult.BodyMismatch();
+    }
+    if (COMPLETED.equals(row.getString("state"))) {
+      return new ClaimResult.Replay(
+          new StoredReply(
+              row.getInt("response_status"),
+              row.getString("response_location"),
+              row.getString("response_body")));
+    }
+    return new ClaimResult.Resumed();
   }
 }
 ```
 
-- `DELETE FROM idempotency_keys WHERE endpoint = ? AND idempotency_key = ?` removes one key. It is used only for an expired key, inside the claim.
+- `resultOf` judges a live row. `row.getString("fingerprint").equals(claim.fingerprint().hex())`: if the stored fingerprint differs from this request's, the answer is `BodyMismatch`. Nothing is written.
+- If the stored state is `COMPLETED`, the code builds a `StoredReply` from the three response columns and returns `Replay`. `COMPLETED.equals(...)` is written with the constant first, which cannot fail on a null.
+- Anything else is a row that is `IN_PROGRESS` with the same fingerprint: `Resumed`.
 
 ## Try it yourself
 

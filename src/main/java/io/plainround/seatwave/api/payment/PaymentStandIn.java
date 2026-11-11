@@ -38,7 +38,9 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class PaymentStandIn implements AutoCloseable {
 
   private static final int MAX_BODY_BYTES = 1_024;
+  private static final int OK = 200;
   private static final int CREATED = 201;
+  // A charge sent again with the same key answers 200 with the first charge, as providers do.
   private static final int REPLAYED = 200;
   private static final int BAD_REQUEST = 400;
   private static final int NOT_FOUND = 404;
@@ -187,7 +189,7 @@ public final class PaymentStandIn implements AutoCloseable {
         chargesByKey
             .values()
             .forEach(charge -> byReference.merge(charge.reference(), 1L, Long::sum));
-        send(exchange, REPLAYED, json.write(ledgerOf(byReference)));
+        send(exchange, OK, json.write(ledgerOf(byReference)));
         return;
       }
       String query = Objects.requireNonNullElse(exchange.getRequestURI().getQuery(), "");
@@ -195,7 +197,7 @@ public final class PaymentStandIn implements AutoCloseable {
         for (StandInMode candidate : StandInMode.values()) {
           if (query.equals("mode=" + candidate.name().toLowerCase(Locale.ROOT))) {
             mode.set(candidate);
-            send(exchange, REPLAYED, "{\"mode\":\"" + query.substring("mode=".length()) + "\"}");
+            send(exchange, OK, "{\"mode\":\"" + query.substring("mode=".length()) + "\"}");
             return;
           }
         }

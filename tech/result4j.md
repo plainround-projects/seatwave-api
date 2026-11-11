@@ -109,27 +109,23 @@ Line 1 shows `ApiSettings.from` on `config/serve.properties` gave a `Success` (a
     if (!reader.problems().isEmpty()) {
       return Result.error(reader.problems());
     }
-    try {
-      return Result.success(
-          new ApiSettings(
-              port,
-              inFlight,
-              url,
-              seed,
-              new Payment(paymentUrl, connect, request, lease),
-              price,
-              currency,
-              Duration.ofSeconds(retryAfterSeconds),
-              new Version0(deprecatedAt, sunsetAt)));
-    } catch (IllegalArgumentException crossFieldProblem) {
-      // Each key was valid alone; a rule between two keys failed (for example the lease).
-      return Result.error(List.of(crossFieldProblem.getMessage()));
-    }
+    // Every rule the constructors check was checked above, so these cannot throw.
+    return Result.success(
+        new ApiSettings(
+            port,
+            inFlight,
+            url,
+            seed,
+            new Payment(paymentUrl, connect, request, lease),
+            price,
+            currency,
+            Duration.ofSeconds(retryAfterSeconds),
+            new Version0(deprecatedAt, sunsetAt)));
   }
 ```
 
 - After the reader has looked at every key, `if (!reader.problems().isEmpty()) return Result.error(reader.problems());` returns all the problems at once. Otherwise the record is built and returned with `Result.success(...)`.
-- The record's constructor still throws `IllegalArgumentException` for a rule between two keys. `catch (IllegalArgumentException crossFieldProblem)` turns that into `Result.error(List.of(message))`. This is the bridge between the two styles: the constructor is for code that must never pass a bad value, `from` is for text from outside.
+- The two rules between keys (the lease against the timeouts, the sunset against the deprecation) are checked earlier in `from` and added to the same problem list with `reader.reject(...)`, so they appear with every other problem. The records' constructors still check the same rules and throw `IllegalArgumentException`, as the last line of defence for code that builds a record directly; the comment says that on this path they cannot throw. This shows the two styles side by side: the constructor is for code that must never pass a bad value, `from` is for text from outside.
 
 ### Building results: a JSON body
 
@@ -137,34 +133,66 @@ Line 1 shows `ApiSettings.from` on `config/serve.properties` gave a `Success` (a
   public <T> Result<T, BindingProblem> read(String json, Class<T> type) {
     Objects.requireNonNull(json, "json");
     Objects.requireNonNull(type, "type");
-    try {
-      T value = mapper.readValue(json, type);
-      if (value == null) {
-        return Result.error(new BindingProblem("", "the body must be a JSON object"));
+    // The parser is driven by hand, so an empty body, a body that is not an object and data after
+    // the object each get their own message instead of one generic type error.
+    try (JsonParser parser = mapper.createParser(json)) {
+      JsonToken first = parser.nextToken();
+      if (first == null) {
+        return Result.error(
+            new BindingProblem(WHOLE_BODY, "the body is empty; send a JSON object"));
+      }
+      if (first != JsonToken.START_OBJECT) {
+        return Result.error(new BindingProblem(WHOLE_BODY, "the body must be a JSON object"));
+      }
+      T value = mapper.readValue(parser, type);
+      if (parser.nextToken() != null) {
+        return Result.error(
+            new BindingProblem(WHOLE_BODY, "the body has data after the JSON object"));
       }
       return Result.success(value);
     } catch (UnrecognizedPropertyException unknownField) {
       return Result.error(
           new BindingProblem(
-              "/" + unknownField.getPropertyName(), "is not a field of this request"));
+              "/" + escaped(unknownField.getPropertyName()), "is not a field of this request"));
     } catch (MismatchedInputException wrongType) {
       return Result.error(new BindingProblem(pointerOf(wrongType), "has the wrong type"));
+    } catch (JsonMappingException unbound) {
+      // 99999999999999999999 is valid JSON; it only does not fit the field's type.
+      if (unbound.getCause() instanceof InputCoercionException) {
+        return Result.error(
+            new BindingProblem(pointerOf(unbound), "is out of range for this field"));
+      }
+      return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
     } catch (JacksonException malformed) {
-      return Result.error(new BindingProblem("", "the body is not valid JSON"));
+      return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
+    } catch (IOException notReadable) {
+      // Every parse failure is a JacksonException; reading from a string has no other I/O to fail.
+      throw new UncheckedIOException("reading a string failed", notReadable);
     }
   }
 ```
 
-- `read` returns `Result<T, BindingProblem>`. Jackson, the JSON library, signals problems with exceptions. The method catches the three it expects and turns each into a `Result.error(new BindingProblem(pointer, detail))`: an unknown field (`is not a field of this request`), a wrong type (`has the wrong type`), anything else that is not valid JSON. A caller never sees a Jackson exception. The `pointer` names the field at fault, so a 400 reply can list it.
+- `read` returns `Result<T, BindingProblem>`. Jackson, the JSON library, signals problems with exceptions. The method checks the shape of the whole body itself (empty, not an object, data after the object) and catches the failures it expects, turning each into a `Result.error(new BindingProblem(pointer, detail))`: an unknown field (`is not a field of this request`), a wrong type (`has the wrong type`), a number out of range (`is out of range for this field`), anything else that is not valid JSON. A caller never sees a Jackson exception. The `pointer` names the field at fault, so a 400 reply can list it.
 
 ### Building results: a query string
 
 ```java
   static Result<Parameters, List<FieldError>> parse(String encoded, Set<String> allowedNames) {
-    Map<String, String> values = new LinkedHashMap<>();
     List<FieldError> errors = new ArrayList<>();
+    Parameters parameters = read(encoded, allowedNames, errors);
+    return errors.isEmpty() ? Result.success(parameters) : Result.error(List.copyOf(errors));
+  }
+
+  /**
+   * Reads every pair, adds one error per bad pair to {@code errors}, and keeps the good ones, so
+   * the caller can still check their values and report every problem in one reply.
+   *
+   * @return the allowed names with their first value
+   */
+  static Parameters read(String encoded, Set<String> allowedNames, List<FieldError> errors) {
+    Map<String, String> values = new LinkedHashMap<>();
     if (encoded.isEmpty()) {
-      return Result.success(new Parameters(values));
+      return new Parameters(values);
     }
     for (String pair : encoded.split("&", -1)) {
       int separator = pair.indexOf('=');
@@ -185,11 +213,11 @@ Line 1 shows `ApiSettings.from` on `config/serve.properties` gave a `Success` (a
         errors.add(new FieldError(pair, "is not valid percent-encoding"));
       }
     }
-    return errors.isEmpty() ? Result.success(new Parameters(values)) : Result.error(errors);
+    return new Parameters(values);
   }
 ```
 
-- `parse` collects errors in a list while it walks the pairs, and returns `Result.error(errors)` if there is any, `Result.success(new Parameters(values))` otherwise. A bad query string produces all its errors in one reply.
+- `read` collects errors in the caller's list while it walks the pairs and always returns the parameters it kept. `parse` wraps it: `Result.error(List.copyOf(errors))` if there is any error, `Result.success(parameters)` otherwise. A bad query string produces all its errors in one reply. `CatalogRoutes` calls `read` directly, so it can check the values of the good parameters too and add those errors to the same reply.
 
 ### Building results: the catalog
 

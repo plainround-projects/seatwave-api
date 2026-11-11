@@ -22,6 +22,20 @@ readonly KEY_PATTERN='^[A-Za-z0-9_-]{1,64}$'
 readonly CURL_TIMEOUT_SECONDS=5
 readonly AUDIT_DIR="build/retry-hold"
 
+# Writes words as one line the shell reads back as the same words: a word with a space, a quote or
+# a brace is put in single quotes, so the printed command can be pasted as it is.
+shell_quoted() {
+  local word line=""
+  for word in "$@"; do
+    if [[ "$word" =~ ^[A-Za-z0-9_./:=-]+$ ]]; then
+      line+="$word "
+    else
+      line+="'${word//\'/\'\\\'\'}' "
+    fi
+  done
+  echo "${line% }"
+}
+
 usage() {
   echo "usage: $0 <port> <seat> <times> <key> [--run] [--yes]" >&2
   exit 2
@@ -60,12 +74,16 @@ curl_command=(curl --silent --show-error --max-time "$CURL_TIMEOUT_SECONDS" \
 echo "plan: $times x POST http://127.0.0.1:$port/v1/holds, seat $seat, Idempotency-Key \"$key\""
 if [[ "$mode" == "dry-run" ]]; then
   echo "dry run: nothing sent. Each request would be:"
-  echo "  ${curl_command[*]}"
+  echo "  $(shell_quoted "${curl_command[@]}")"
   echo "add --run to send them"
   exit 0
 fi
 if [[ "$confirmed" != "yes" ]]; then
-  read -r -p "send $times requests to 127.0.0.1:$port? [y/N] " answer
+  # Without a terminal there is nobody to answer; with set -e a failed read would end the script
+  # silently, so the refusal is said out loud instead.
+  [[ -t 0 ]] || { echo "nothing sent: no terminal to confirm on; read the plan, then add --yes" >&2; exit 1; }
+  answer=""
+  read -r -p "send $times requests to 127.0.0.1:$port? [y/N] " answer || true
   [[ "$answer" == "y" ]] || { echo "nothing sent" >&2; exit 1; }
 fi
 

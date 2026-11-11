@@ -2,7 +2,7 @@
 
 ## What it is
 
-This file covers every test source file that the two other walkthroughs do not: the five helpers in the root test package, the test packages `catalog`, `config`, `http`, `load`, `payment` and `store`, and the one file under `src/test/resources`. The `contract` package is in `tests-contract-walkthrough.md`; the `booking` and `idempotency` packages are in `tests-booking-and-idempotency-walkthrough.md`.
+This file covers every test source file that the two other walkthroughs do not: the five helpers and the script test in the root test package, the test packages `catalog`, `config`, `http`, `json`, `load`, `payment` and `store`, and the one file under `src/test/resources`. The `contract` package is in `tests-contract-walkthrough.md`; the `booking` and `idempotency` packages are in `tests-booking-and-idempotency-walkthrough.md`.
 
 All paths are under `src/test/java/io/plainround/seatwave/api/` unless they start with `src/test/resources/`.
 
@@ -13,14 +13,17 @@ All paths are under `src/test/java/io/plainround/seatwave/api/` unless they star
 | `MutableClock.java` | helper | A clock that moves only when a test moves it. |
 | `HttpStatus.java` | helper | Names for the status numbers the tests expect. |
 | `AllAtOnce.java` | helper | Runs many tasks at the same moment. |
+| `RetryHoldScriptTest.java` | test | The guarded script's dry run prints a line that can be pasted; a run with nobody to confirm it sends nothing. |
 | `catalog/CursorsTest.java` | test | The pagination cursors: written, read back, forged. |
 | `catalog/PaginationConsistencyTest.java` | test | The cursor walk skips and repeats nothing while data changes; the offset walk does. |
 | `config/ApiSettingsTest.java` | test | The settings file and the rules for its values. |
 | `http/ApiServerTest.java` | test | Unknown paths, wrong methods, overload. |
+| `http/ReplyTest.java` | test | A reply keeps its headers in the order they were added. |
 | `http/Version0CompatibilityTest.java` | test | Module 1's paths still answer as before, with deprecation headers. |
+| `json/JsonCodecTest.java` | test | Every way a body can fail to bind, each at the pointer of what is wrong. |
 | `load/RetryStormTest.java` | test | The retry storm finds no double effect. |
 | `payment/PaymentStandInTest.java` | test | The stand-in provider charges once per key and never pretends. |
-| `store/DatabaseTest.java` | test | Migrations apply once; the seed runs once; the database refuses an unknown status. |
+| `store/DatabaseTest.java` | test | Migrations apply once and survive a crash between a script and its history row; the seed runs once; hold lookups use their index; the database refuses an unknown status. |
 | `src/test/resources/logback-test.xml` | resource | The logging setup of the tests. |
 
 ## Why this repository uses it
@@ -722,6 +725,114 @@ A record of three parts: the status, the headers (names in lower case, first val
 
 Four getters (`clock`, `provider`, `port`) and `close()`. `close` shuts the client, then the API; the `finally` makes sure the provider is closed even if closing the API fails.
 
+### `RetryHoldScriptTest.java`
+
+This test runs the guarded script `scripts/retry-hold.sh` (`bash-retry-hold.md`) from Java, in the two ways that send nothing.
+
+#### Setup
+
+```java
+package io.plainround.seatwave.api;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.Test;
+
+/**
+ * The guarded script, run only in ways that send nothing: the dry run, and a run that has nobody to
+ * confirm it. No server is started, so a request that slipped through would fail to connect.
+ */
+class RetryHoldScriptTest {
+
+  private static final String SCRIPT = "scripts/retry-hold.sh";
+  private static final long RUN_LIMIT_SECONDS = 30;
+  private static final int REFUSED = 1;
+```
+
+- The class lives in the root test package because the script belongs to no Java package. `java.io.File` names `/dev/null`, `IOException` and `TimeUnit` serve the helper that runs a process, and `StandardCharsets` reads its output as UTF-8.
+- The Javadoc states the safety of the test itself: it runs the dry run and a run that has nobody to confirm it, and no server is started, so a request that slipped through would only fail to connect.
+- `SCRIPT` is the path from the project folder, where Gradle runs the tests. `RUN_LIMIT_SECONDS = 30` is how long one run may take before the test gives up. `REFUSED = 1` is the exit status the script uses for "nothing sent".
+
+#### The dry run prints a line that can be pasted
+
+```java
+  @Test
+  void printsACurlCommandThatTheShellReadsBackWordForWord() throws Exception {
+    Run dryRun = run(new ProcessBuilder("bash", SCRIPT, "8087", "A-8", "4", "fan-8-hold-1"));
+    String curlLine =
+        dryRun
+            .standardOutput()
+            .lines()
+            .filter(line -> line.startsWith("  curl "))
+            .findFirst()
+            .orElseThrow()
+            .strip();
+
+    // The shell splits the pasted line into words; each word is printed on its own line.
+    Run pasted =
+        run(new ProcessBuilder("bash", "-c", "set -- " + curlLine + "; printf '%s\\n' \"$@\""));
+
+    assertThat(dryRun.exitStatus()).isZero();
+    assertThat(pasted.standardOutput().lines())
+        .contains(
+            "Content-Type: application/json",
+            "Idempotency-Key: \"fan-8-hold-1\"",
+            "{\"eventId\":1,\"seat\":\"A-8\",\"customer\":\"script\"}",
+            "%{http_code}");
+  }
+```
+
+- `new ProcessBuilder("bash", SCRIPT, "8087", "A-8", "4", "fan-8-hold-1")` describes a command: `bash` running the script with a port, a seat, a count and a key, and no `--run`, so it is a dry run. `run(...)` (below) starts it and collects what it printed.
+- The stream chain finds the printed command: `.lines()` splits the output into lines, `.filter(line -> line.startsWith("  curl "))` keeps the one that starts with two spaces and `curl`, `.findFirst().orElseThrow()` takes it or fails, and `.strip()` removes the spaces around it.
+- The comment explains the second process. `bash -c "set -- <line>; printf '%s\n' \"$@\""` makes a fresh shell read the line exactly as a person pasting it would: `set --` turns the words into the shell's arguments, and `printf '%s\n' "$@"` prints each argument on its own line. (In the Java text, `\\n` and `\"` are a backslash-n and a quote, written with Java's escapes.)
+- The dry run must end with status 0, and the words the shell read back must include `Content-Type: application/json`, `Idempotency-Key: "fan-8-hold-1"` and the whole JSON body, each as **one** word, and `%{http_code}`. Before the fix the script printed the words without quotes, and a shell split `Content-Type: application/json` into two words; this assertion failed.
+
+#### A run with nobody to confirm it
+
+```java
+  @Test
+  void saysNothingWasSentWhenNoTerminalCanConfirmTheRun() throws Exception {
+    Run refused =
+        run(
+            new ProcessBuilder("bash", SCRIPT, "8087", "A-8", "4", "fan-8-hold-1", "--run")
+                .redirectInput(new File("/dev/null")));
+
+    assertThat(refused.exitStatus()).isEqualTo(REFUSED);
+    assertThat(refused.standardError()).contains("nothing sent");
+    assertThat(refused.standardOutput()).doesNotContain("attempt");
+  }
+```
+
+- The same command with `--run` but without `--yes`, and `.redirectInput(new File("/dev/null"))`: the script's input is an empty file, not a terminal, so nobody can answer its question.
+- The exit status must be 1, standard error must say `nothing sent`, and standard output must not contain `attempt`, the word the script prints for each request it sends. Before the fix the script stopped with status 1 and said nothing at all.
+
+#### The helper that runs a process
+
+```java
+  private record Run(int exitStatus, String standardOutput, String standardError) {}
+
+  private static Run run(ProcessBuilder command) throws IOException, InterruptedException {
+    Process process = command.start();
+    if (!process.waitFor(RUN_LIMIT_SECONDS, TimeUnit.SECONDS)) {
+      process.destroyForcibly();
+      throw new AssertionError("the script did not finish: " + command.command());
+    }
+    return new Run(
+        process.exitValue(),
+        new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8),
+        new String(process.getErrorStream().readAllBytes(), StandardCharsets.UTF_8));
+  }
+}
+```
+
+- `Run` is a small record of what one process left: its exit status and the two texts it printed.
+- `command.start()` starts the process. `waitFor(RUN_LIMIT_SECONDS, TimeUnit.SECONDS)` waits at most 30 seconds and returns `false` if the process is still running; the test then kills it (`destroyForcibly`) and fails with the command in the message, so a script that hangs cannot hang the build.
+- `process.getInputStream()` is the process's standard output, as seen from Java (an input for the reader), and `getErrorStream()` its standard error. `readAllBytes()` reads each to the end and `new String(..., StandardCharsets.UTF_8)` makes text of it. The outputs here are a few lines, so reading them after the process ends cannot fill a pipe and block.
+
 ### `catalog/CursorsTest.java`
 
 #### What a cursor is
@@ -888,10 +999,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.github.sviperll.result4j.Result;
 import io.plainround.seatwave.api.TestApi;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Properties;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class ApiSettingsTest {
 
@@ -911,7 +1024,7 @@ class ApiSettingsTest {
 - `Result<ApiSettings, List<String>>` is a value from the result4j library (`result4j.md`): it is either a `Result.Success` holding the settings or a `Result.Error` holding the list of problems. The settings reader never throws for a bad value; it collects the problems.
 - `SettingsReader.load(Path)` reads a `.properties` file into a `Properties` object (`java-properties.md` explains the format). `new SettingsReader(properties)` wraps it in a typed reader. `ApiSettings.from(reader)` builds the settings or lists every problem.
 - Test 1: the file the repository ships, `config/serve.properties`, must give a `Result.Success`. If someone breaks the shipped file, the build fails.
-- `UNUSED_PROVIDER_PORT = 18_100` and `MORE_SECTIONS_THAN_A_TO_T = 21` are used below.
+- `UNUSED_PROVIDER_PORT = 18_100` and `MORE_SECTIONS_THAN_A_TO_T = 21` are used below. `IOException` and `@TempDir` serve the test of a settings file that cannot be loaded.
 
 #### Every missing key at once
 
@@ -977,6 +1090,60 @@ The messages must say, respectively, `payment.url must be http://127.0.0.1:<port
 ```
 
 `payment.leaseMillis` is set to 1000. The shipped connect and request timeouts add up to more than that. A lease shorter than the payment call would let a second attempt take over while the first is still paying, so the settings refuse it: `payment.leaseMillis must be longer than the connect and request timeouts`.
+
+#### Both rules between keys, in one run
+
+```java
+  @Test
+  void reportsBothRulesBetweenKeysWithTheOtherProblemsInOneRun() throws Exception {
+    Properties properties = SettingsReader.load(Path.of("config/serve.properties"));
+    properties.setProperty("payment.leaseMillis", "1000");
+    properties.setProperty("version0.sunsetAt", properties.getProperty("version0.deprecatedAt"));
+    properties.setProperty("http.port", "80");
+
+    assertThat(ApiSettings.from(new SettingsReader(properties)).toString())
+        .contains("http.port must be from 1024 to 65535")
+        .contains("payment.leaseMillis must be longer than the connect and request timeouts")
+        .contains("version0.sunsetAt must be after version0.deprecatedAt");
+  }
+```
+
+Three values are spoiled at once: the lease is too short for the timeouts, the sunset is the same instant as the deprecation (`properties.getProperty("version0.deprecatedAt")` copies it), and the port is privileged. All three lines must be in one result. Before the fix, the two rules between keys were thrown by the record constructors one at a time, after every single key had passed, so this run printed only the port line.
+
+```java
+  @Test
+  void checksARuleBetweenKeysOnlyWhenEachKeyIsValidAlone() throws Exception {
+    Properties properties = SettingsReader.load(Path.of("config/serve.properties"));
+    properties.remove("payment.leaseMillis");
+    properties.remove("version0.sunsetAt");
+
+    assertThat(ApiSettings.from(new SettingsReader(properties)).toString())
+        .contains("payment.leaseMillis is missing")
+        .contains("version0.sunsetAt is missing")
+        .doesNotContain("must be longer than")
+        .doesNotContain("must be after");
+  }
+```
+
+The lease and the sunset are removed. `properties.remove(key)` deletes a key. The result must say both are missing, and must not add the two rules between keys: those compare values, and a missing value comes back as a stand-in that proves nothing. `doesNotContain` checks that a text is absent.
+
+#### A settings file that cannot be loaded
+
+```java
+  @Test
+  void saysWhatIsWrongWithASettingsFileThatCannotBeLoaded(@TempDir Path folder) {
+    Path missing = folder.resolve("serve.properties");
+
+    assertThatThrownBy(() -> SettingsReader.load(missing))
+        .isInstanceOf(IOException.class)
+        .hasMessage("the settings file " + missing + " does not exist");
+    assertThatThrownBy(() -> SettingsReader.load(folder))
+        .isInstanceOf(IOException.class)
+        .hasMessageStartingWith("the settings file " + folder + " cannot be read: ");
+  }
+```
+
+`@TempDir Path folder` asks JUnit for a new empty folder (`junit.md`). `folder.resolve("serve.properties")` is a file in it that does not exist. Loading it must throw an `IOException` whose whole message is `the settings file <path> does not exist`; `hasMessage` compares the full text. Loading the folder itself, which is not a file, must say `cannot be read:` followed by the system's reason. Before the fix, the message was only the path, and a reader had to guess what was wrong with it.
 
 #### Impossible values cannot be built
 
@@ -1084,6 +1251,39 @@ class ApiServerTest {
 - Test 2 starts an API whose limit is **one** request in flight. A seat is held, the provider is set to `CHARGE_THEN_TIMEOUT`, and a confirm is started in the background. The test waits (Awaitility) until the provider has captured the charge, which means the confirm is waiting for the provider and holding the only slot (`awaitility.md` walks through this test).
 - While the slot is busy, `GET /v1/events` must be refused at once: `503`, the problem type `/problems/service-busy`, and `Retry-After: 1`. The server sheds load instead of queueing it. The background confirm then ends with `503` too, because the provider's reply is later than the timeout.
 - `ExecutorService background = Executors.newVirtualThreadPerTaskExecutor()` runs the confirm on a virtual thread; the `try` closes it. `Future<TestApi.Response> slowConfirm` is the promise of its result, and `slowConfirm.get()` waits for it.
+
+### `http/ReplyTest.java`
+
+```java
+package io.plainround.seatwave.api.http;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import io.plainround.seatwave.api.HttpStatus;
+import org.junit.jupiter.api.Test;
+
+class ReplyTest {
+
+  @Test
+  void keepsItsHeadersInTheOrderTheyWereAdded() {
+    Reply reply =
+        Reply.json(HttpStatus.OK, "[]")
+            .withHeader("Deprecation", "@1")
+            .withHeader("Sunset", "Thu, 01 Jan 2027 00:00:00 GMT")
+            .withHeader("Link", "</v1/events>; rel=\"successor-version\"")
+            .withHeader("Retry-After", "1")
+            .withHeader("Location", "/v1/holds/x")
+            .withHeader("Allow", "GET");
+
+    assertThat(reply.headers().keySet())
+        .containsExactly("Deprecation", "Sunset", "Link", "Retry-After", "Location", "Allow");
+  }
+}
+```
+
+- The test is in the package `http`, the same as `Reply`, so it may call the package-private `Reply.json` and `withHeader`.
+- It builds one reply and adds six headers in a fixed order: `Deprecation`, `Sunset`, `Link`, `Retry-After`, `Location`, `Allow`. Each `withHeader` returns a new `Reply` with one more header.
+- `reply.headers().keySet()` is the set of header names. `containsExactly(...)` checks the names **and their order**. Before the fix the constructor copied the headers with `Map.copyOf`, whose order is not fixed, and this run printed `["Allow", "Sunset", "Retry-After", "Link", "Deprecation", "Location"]`. Six headers make it very unlikely that a map with no order puts them back in the order they were added by chance.
 
 ### `http/Version0CompatibilityTest.java`
 
@@ -1230,6 +1430,117 @@ The comment says it: "Failure mode 1 as version 0 shows it: no key, so the retry
 ```
 
 Eight requests with exactly the old answers: `invalid eventId`, `invalid seat`, `invalid customer`, `409` for a seat that does not exist (`A-0`), `malformed form field` for a field with no `=`, `413` for a body over the limit, `invalid holdId`, and `hold missing or expired` for an unknown hold.
+
+### `json/JsonCodecTest.java`
+
+Each test sends one body to `JsonCodec.read` and checks the exact `BindingProblem` that comes back (`java-http-walkthrough.md` explains the codec).
+
+#### Setup
+
+```java
+package io.plainround.seatwave.api.json;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import com.github.sviperll.result4j.Result;
+import org.junit.jupiter.api.Test;
+
+/** Every way a body can fail to bind, each reported at the JSON pointer of what is wrong. */
+class JsonCodecTest {
+
+  private final JsonCodec json = new JsonCodec();
+
+  /** The shape of a hold request: a whole number and two strings. */
+  record HoldBody(Long eventId, String seat, String customer) {}
+```
+
+- The test is in the package `json`, beside `JsonCodec`. `Result` is result4j's success-or-error type (`result4j.md`).
+- `json` is one real codec, the same class the API uses.
+- `HoldBody` is a record with the shape of a hold request, a `Long` and two `String`s. The test defines its own instead of using the API's, which is private to the `http` package.
+
+#### A number or a boolean for a string field
+
+```java
+  @Test
+  void refusesANumberOrABooleanSentForAStringField() {
+    assertThat(problemOf("{\"eventId\":1,\"seat\":\"D-1\",\"customer\":5}"))
+        .isEqualTo(new JsonCodec.BindingProblem("/customer", "has the wrong type"));
+    assertThat(problemOf("{\"eventId\":1,\"seat\":true,\"customer\":\"fan_1\"}"))
+        .isEqualTo(new JsonCodec.BindingProblem("/seat", "has the wrong type"));
+    assertThat(problemOf("{\"eventId\":1,\"seat\":1.5,\"customer\":\"fan_1\"}"))
+        .isEqualTo(new JsonCodec.BindingProblem("/seat", "has the wrong type"));
+  }
+```
+
+- `5` for `customer`, `true` for `seat` and `1.5` for `seat` must each be refused at the field's pointer with `has the wrong type`. `isEqualTo` works because `BindingProblem` is a record: two records with the same fields are equal. Before the coercion configuration, all three bound, and `customer` became the text `"5"`.
+
+#### Problems of the whole body
+
+```java
+  @Test
+  void reportsAProblemWithTheWholeBodyAtTheEmptyPointerAndSaysWhatIsWrong() {
+    assertThat(problemOf(""))
+        .isEqualTo(new JsonCodec.BindingProblem("", "the body is empty; send a JSON object"));
+    assertThat(problemOf("[1]"))
+        .isEqualTo(new JsonCodec.BindingProblem("", "the body must be a JSON object"));
+    assertThat(problemOf("{\"eventId\":1,\"seat\":\"A-7\",\"customer\":\"fan_7\"} {}"))
+        .isEqualTo(new JsonCodec.BindingProblem("", "the body has data after the JSON object"));
+  }
+```
+
+- An empty body, the array `[1]`, and an object followed by a second value each get the empty pointer `""`, which RFC 6901 defines as the whole document, and a message that says what is wrong. Before the fix all three came back at the pointer `/` with `has the wrong type`.
+
+#### A number too large for its field
+
+```java
+  @Test
+  void reportsANumberTooLargeForItsFieldAtTheFieldsPointer() {
+    assertThat(problemOf("{\"eventId\":99999999999999999999,\"seat\":\"D-1\",\"customer\":\"x\"}"))
+        .isEqualTo(new JsonCodec.BindingProblem("/eventId", "is out of range for this field"));
+  }
+```
+
+- `99999999999999999999` is a valid JSON number, but it does not fit a `Long`. The problem must name the field, `/eventId`, and say `is out of range for this field`. Before the fix it said `the body is not valid JSON` at the whole body.
+
+#### An unknown name with a slash and a tilde
+
+```java
+  @Test
+  void escapesASlashAndATildeInAnUnknownFieldName() {
+    assertThat(problemOf("{\"a/b~c\":1}"))
+        .isEqualTo(new JsonCodec.BindingProblem("/a~1b~0c", "is not a field of this request"));
+  }
+```
+
+- The field name `a/b~c` is unknown, so it is refused. In a JSON pointer, `/` separates steps and `~` starts an escape, so RFC 6901 writes them `~1` and `~0`: the pointer must be `/a~1b~0c`, which names one field and not a path.
+
+#### Broken syntax
+
+```java
+  @Test
+  void stillCallsBrokenSyntaxInvalidJson() {
+    assertThat(problemOf("{\"eventId\":1,"))
+        .isEqualTo(new JsonCodec.BindingProblem("", "the body is not valid JSON"));
+  }
+```
+
+- A body that stops in the middle is still `the body is not valid JSON` at the whole body. This test keeps the old message honest for the case it was meant for.
+
+#### The helper
+
+```java
+  private JsonCodec.BindingProblem problemOf(String body) {
+    return switch (json.read(body, HoldBody.class)) {
+      case Result.Error<HoldBody, JsonCodec.BindingProblem>(JsonCodec.BindingProblem problem) ->
+          problem;
+      case Result.Success<HoldBody, JsonCodec.BindingProblem>(HoldBody bound) ->
+          throw new AssertionError("the body bound to " + bound);
+    };
+  }
+}
+```
+
+- `problemOf(body)` reads the body and returns the problem. The `switch` over the `Result` has one case per side (`java.md` explains record patterns): an `Error` gives its `BindingProblem`; a `Success` means the body bound when it should not have, so the test fails with an `AssertionError` that shows what was bound.
 
 ### `load/RetryStormTest.java`
 
@@ -1497,6 +1808,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Clock;
 import java.time.ZoneOffset;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -1505,7 +1817,7 @@ class DatabaseTest {
   private static final int EVENTS = 2;
   private static final int SECTIONS = 2;
   private static final int SEATS_PER_SECTION = 3;
-  private static final int MIGRATIONS = 3;
+  private static final int MIGRATIONS = 4;
   private static final int LAST_SEAT_OF_A_SECTION = 1_000;
 
   @Test
@@ -1530,8 +1842,9 @@ class DatabaseTest {
 
 - `@TempDir Path folder` gives the test an empty folder (`junit.md`). The database is a **file** there: `"jdbc:h2:file:" + folder.resolve("seatwave").toAbsolutePath()`.
 - The seed is 2 events, 2 sections and 3 seats per section. `Clock.fixed(TestApi.START, ZoneOffset.UTC)` is a clock that never moves.
-- The first `Database.open(url)` applies the three migrations (the versioned SQL files under `src/main/resources/db/migration`, `h2-sql-and-migrations.md`) and `seedIfEmpty` fills the tables. The block ends and the database closes.
-- The second `Database.open(url)` opens the **same file**. It must apply nothing again, and `seedIfEmpty` must add nothing. The test counts: `schema_history` has `MIGRATIONS` = 3 rows (one per migration), `events` has 2 rows and `seats` has `SECTIONS * SEATS_PER_SECTION` = 6 rows. Running everything twice gives the same data as running it once.
+- `java.util.List` is imported for the list of lookups in the query-plan test below.
+- The first `Database.open(url)` applies the four migrations (the versioned SQL files under `src/main/resources/db/migration`, `h2-sql-and-migrations.md`) and `seedIfEmpty` fills the tables. The block ends and the database closes.
+- The second `Database.open(url)` opens the **same file**. It must apply nothing again, and `seedIfEmpty` must add nothing. The test counts: `schema_history` has `MIGRATIONS` = 4 rows (one per migration), `events` has 2 rows and `seats` has `SECTIONS * SEATS_PER_SECTION` = 6 rows. Running everything twice gives the same data as running it once.
 
 #### The third migration fills the seat number from the label
 
@@ -1566,6 +1879,66 @@ Module 1's database had seats without a `seat_number`. Migration `V3__seat_order
 - `RUNSCRIPT FROM 'classpath:/db/migration/V3__seat_order_for_cursors.sql'` runs the real migration script again (H2's command to run a script file; `classpath:` means "from the program's resources").
 - The check: the number of seat `T-1000` is now `LAST_SEAT_OF_A_SECTION` = 1,000. The old row was migrated correctly.
 
+#### Start-up after a crash between a script and its history row
+
+```java
+  @Test
+  void startsAfterACrashBetweenEveryScriptAndItsHistoryRow(@TempDir Path folder) throws Exception {
+    String url = "jdbc:h2:file:" + folder.resolve("seatwave").toAbsolutePath();
+    ApiSettings.Seed seed = new ApiSettings.Seed(EVENTS, SECTIONS, SEATS_PER_SECTION);
+    try (Database first = Database.open(url)) {
+      first.seedIfEmpty(seed, Clock.fixed(TestApi.START, ZoneOffset.UTC));
+      // H2 commits each DDL statement at once, so a crash after a script and before its INSERT
+      // leaves the schema changed and the history without the row: this is that state.
+      try (Connection connection = first.connect();
+          Statement statement = connection.createStatement()) {
+        statement.execute("DELETE FROM schema_history");
+      }
+    }
+
+    try (Database again = Database.open(url)) {
+      assertThat(number(again, "SELECT COUNT(*) FROM schema_history")).isEqualTo(MIGRATIONS);
+      assertThat(number(again, "SELECT COUNT(*) FROM seats"))
+          .isEqualTo(SECTIONS * SEATS_PER_SECTION);
+    }
+  }
+```
+
+`Database` runs a migration script and then writes its row in `schema_history`: two separate commits, because H2 commits each schema statement at once. The comment in the test names the state a crash between the two leaves: the schema already changed, the history without the row. The test builds that state on purpose. It opens a file database, seeds it, and then deletes **every** history row, as if the process had died after each script. Then it opens the same file again. That second `Database.open` runs all four scripts a second time, so it must not fail on objects that are already there; it must record four rows again, and the six seeded seats must still be there. Before every migration statement had `IF NOT EXISTS`, this test failed at once with `Table "EVENTS" already exists`.
+
+#### Every hold lookup uses the index
+
+```java
+  @Test
+  void findsASeatByItsHoldThroughAnIndexNotATableScan() throws Exception {
+    // The WHERE clauses of SeatLedger's findHold, leaseForConfirm, markConfirmed, cancel and
+    // releaseLease, each read as H2 would run it.
+    List<String> lookups =
+        List.of(
+            "SELECT event_id FROM seats WHERE hold_id = 'h'",
+            "UPDATE seats SET status = 'CONFIRMING' WHERE hold_id = 'h' AND ((status = 'HELD'"
+                + " AND hold_expires_at > 0) OR (status = 'CONFIRMING' AND confirm_lease_until <= 0))",
+            "UPDATE seats SET status = 'CONFIRMED' WHERE hold_id = 'h' AND status = 'CONFIRMING'",
+            "UPDATE seats SET status = 'AVAILABLE' WHERE hold_id = 'h' AND status = 'HELD'",
+            "UPDATE seats SET confirm_lease_until = 1 WHERE hold_id = 'h' AND status = 'CONFIRMING'");
+    try (Database database = Database.open("jdbc:h2:mem:plan-" + System.nanoTime())) {
+      database.seedIfEmpty(
+          new ApiSettings.Seed(EVENTS, SECTIONS, SEATS_PER_SECTION),
+          Clock.fixed(TestApi.START, ZoneOffset.UTC));
+      for (String lookup : lookups) {
+        assertThat(plan(database, lookup))
+            .as(lookup)
+            .contains("SEATS_BY_HOLD")
+            .doesNotContain("tableScan");
+      }
+    }
+  }
+```
+
+`SeatLedger` finds a seat by its hold in five places, and the comment names them. `lookups` holds one statement with the same `WHERE` clause as each: the read of `findHold`, the conditional `UPDATE` of `leaseForConfirm` (the longest), and those of `markConfirmed`, `cancel` and `releaseLease`. The values (`'h'`, `0`, `1`) are placeholders; a plan does not depend on them.
+
+For each statement, `plan(...)` (a helper below) asks H2 how it would run it. The plan must name the index `SEATS_BY_HOLD` from V4, and must not contain `tableScan`, H2's word for "read every row". `.as(lookup)` labels the assertion with the statement, so a failure says which lookup went wrong. Before V4, every plan said `/* PUBLIC.SEATS.tableScan */`.
+
 #### The database refuses an unknown status
 
 ```java
@@ -1582,6 +1955,15 @@ Module 1's database had seats without a `seat_number`. Migration `V3__seat_order
     }
   }
 
+  private static String plan(Database database, String sql) throws SQLException {
+    try (Connection connection = database.connect();
+        Statement statement = connection.createStatement();
+        ResultSet rows = statement.executeQuery("EXPLAIN " + sql)) {
+      rows.next();
+      return rows.getString(1);
+    }
+  }
+
   private static long number(Database database, String sql) throws SQLException {
     try (Connection connection = database.connect();
         Statement statement = connection.createStatement();
@@ -1594,6 +1976,7 @@ Module 1's database had seats without a `seat_number`. Migration `V3__seat_order
 ```
 
 - An `INSERT` with the status `SOLD_TWICE` must throw `SQLException`. The table has a rule (`known_seat_status`, a `CHECK` that allows only `AVAILABLE`, `HELD`, `CONFIRMING` and `CONFIRMED`). The database itself guards the data, whatever the application code does.
+- `plan(database, sql)` runs `EXPLAIN` followed by the statement. `EXPLAIN` does not run the statement; it returns one row with one text column, the plan: the statement as H2 will execute it, with a comment such as `/* PUBLIC.SEATS_BY_HOLD: HOLD_ID = 'h' */` that names the index it will use.
 - `number(database, sql)` is a helper that opens a connection, runs a query and returns the first column of the first row as a `long`. Three resources are opened in one `try ( ... )`: a connection, a statement and a result set; all are closed in reverse order.
 
 ### `src/test/resources/logback-test.xml`
@@ -1633,10 +2016,10 @@ All ran in a scratch copy on 11 November 2026. Timings differ on every run.
 1. Run the tests of these packages and count them:
 
 ```
-./gradlew --offline cleanTest test --tests '*catalog*' --tests '*config*' --tests '*http*' --tests '*load*' --tests '*payment*' --tests '*store*' | grep -c PASSED
+./gradlew --offline cleanTest test --tests '*catalog*' --tests '*config*' --tests '*http*' --tests '*json*' --tests '*load*' --tests '*payment*' --tests '*store*' --tests '*RetryHoldScriptTest' | grep -c PASSED
 ```
 
-   Output: `28`: `CursorsTest` 3, `PaginationConsistencyTest` 3, `ApiSettingsTest` 5, `ApiServerTest` 2, `Version0CompatibilityTest` 5, `RetryStormTest` 1, `PaymentStandInTest` 6 and `DatabaseTest` 3.
+   Output: `41`: `CursorsTest` 3, `PaginationConsistencyTest` 3, `ApiSettingsTest` 8, `ApiServerTest` 2, `ReplyTest` 1, `Version0CompatibilityTest` 5, `JsonCodecTest` 5, `RetryStormTest` 1, `PaymentStandInTest` 6, `DatabaseTest` 5 and `RetryHoldScriptTest` 2.
 
 2. Run the retry storm test alone:
 

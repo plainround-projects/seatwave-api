@@ -20,7 +20,7 @@ The repository is the hands-on project of Module 7, "Designing the contract: API
 
 | File | Role |
 |---|---|
-| `h2-sql-and-migrations.md` | A relational database, tables, keys, constraints, transactions and row locks from zero; H2 2.5.252; every file under `src/main/resources/` (the three migrations and `logback.xml`), why migrations only add, and how they run at start-up. |
+| `h2-sql-and-migrations.md` | A relational database, tables, keys, constraints, transactions and row locks from zero; H2 2.5.252; every file under `src/main/resources/` (the four migrations and `logback.xml`), why migrations only add, and how they run at start-up. |
 | `openapi-contract.md` | What an API contract is, YAML basics, the OpenAPI 3.1 structure, and every file under `openapi/` line by line: the current contract, the released copy, the additive and the breaking 1.1.0 candidates, and the two Lab 1 files. |
 | `java-properties.md` | The `.properties` format and the five settings files under `config/`, key by key, with what changes when a value changes. |
 

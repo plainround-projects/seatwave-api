@@ -92,7 +92,33 @@ readonly AUDIT_DIR="build/retry-hold"
 - `CURL_TIMEOUT_SECONDS=5` is how long `curl` may wait for one reply.
 - `AUDIT_DIR="build/retry-hold"` is the folder for the audit log and the last reply. Double quotes let a variable inside be expanded; here there is none.
 
-### The `usage` function (lines 25 to 28)
+### Printing a command that can be pasted (lines 25 to 37)
+
+```bash
+# Writes words as one line the shell reads back as the same words: a word with a space, a quote or
+# a brace is put in single quotes, so the printed command can be pasted as it is.
+shell_quoted() {
+  local word line=""
+  for word in "$@"; do
+    if [[ "$word" =~ ^[A-Za-z0-9_./:=-]+$ ]]; then
+      line+="$word "
+    else
+      line+="'${word//\'/\'\\\'\'}' "
+    fi
+  done
+  echo "${line% }"
+}
+```
+
+- Lines 25 and 26 are the comment: the function writes a list of words as one line that the shell, reading it back, splits into the same words. The dry run uses it to print the curl command.
+- `shell_quoted() { ... }` defines a function (functions are explained with `usage` below). It receives the words as its arguments.
+- `local word line=""` makes two variables that exist only inside the function: `word` for the loop and `line` for the result, which starts empty.
+- `for word in "$@"; do ... done` visits each argument in turn.
+- `[[ "$word" =~ ^[A-Za-z0-9_./:=-]+$ ]]` tests whether the word has only "safe" characters: letters, digits and `_ . / : = -`. Such a word means the same with or without quotes, so `line+="$word "` adds it as it is, with a space after it. `+=` appends text to a variable.
+- Any other word (one with a space, a double quote, a brace or a comma) is wrapped in single quotes. Inside single quotes the shell changes nothing, so `'Content-Type: application/json'` stays one word. The one character that cannot appear inside single quotes is the single quote itself. `${word//\'/...}` replaces every `'` in the word with `'\''`: close the quotes, a backslash-protected quote, open the quotes again. None of this script's words contains a single quote, but the function stays correct if one ever does.
+- `echo "${line% }"` prints the line. `${line% }` removes one trailing space, the one after the last word.
+
+### The `usage` function (lines 39 to 42)
 
 ```bash
 usage() {
@@ -105,7 +131,7 @@ usage() {
 - `echo "usage: $0 <port> <seat> <times> <key> [--run] [--yes]" >&2` prints the usage text. `$0` is the name the script was started with, so the text shows `scripts/retry-hold.sh`. `>&2` sends it to standard error.
 - `exit 2` stops the script with code 2. By convention 2 means "the command was used wrongly".
 
-### Reading the arguments (lines 30 to 44)
+### Reading the arguments (lines 44 to 58)
 
 ```bash
 [[ $# -ge 4 ]] || usage
@@ -132,7 +158,7 @@ done
 - `for option in "$@"; do ... done` loops over the remaining words. `"$@"` expands to each remaining argument as its own word.
 - `case "$option" in ... esac` compares the word with patterns. `--run) mode="run" ;;` sets run mode. `--yes) confirmed="yes" ;;` records that the question is skipped. `*) usage ;;` is the catch-all: any other word is an error. `;;` ends one branch.
 
-### Checking the tool and every input (lines 46 to 53)
+### Checking the tool and every input (lines 60 to 67)
 
 ```bash
 # Check before: the tool and every input.
@@ -146,14 +172,14 @@ command -v curl >/dev/null || { echo "curl is not installed" >&2; exit 1; }
 ```
 
 - `command -v curl >/dev/null` asks the shell whether a command named `curl` exists. `>/dev/null` throws the printed path away. If the command is missing, `command -v` fails and the group after `||` runs: `{ echo "curl is not installed" >&2; exit 1; }` prints a message and stops with code 1. A `{ ...; }` group runs several commands as one.
-- Lines 48 and 49 check the port. `[[ "$port" =~ ^[0-9]+$ ]]` tests that the text is only digits (`=~` means "matches this regular expression"; `+` means one or more). Only then does `(( port >= LOWEST_PORT && port <= HIGHEST_PORT ))` run: `(( ... ))` is Bash arithmetic, and `&&` means "and". The order matters: a word like `abc` is stopped by the first test, so the arithmetic never sees text. The backslash at the end of line 48 joins it to line 49, where `|| { ...; exit 2; }` prints "the port must be 1024 to 65535" and stops with code 2 if either test failed.
-- Line 50 checks the seat against `SEAT_PATTERN`. The variable is on the right side without quotes: that is how Bash knows it is a pattern and not a plain string.
-- Lines 51 and 52 check `times` the same way as the port: digits only, then `times >= 1 && times <= MAX_TIMES`.
-- Line 53 checks the key against `KEY_PATTERN`.
+- Lines 62 and 63 check the port. `[[ "$port" =~ ^[0-9]+$ ]]` tests that the text is only digits (`=~` means "matches this regular expression"; `+` means one or more). Only then does `(( port >= LOWEST_PORT && port <= HIGHEST_PORT ))` run: `(( ... ))` is Bash arithmetic, and `&&` means "and". The order matters: a word like `abc` is stopped by the first test, so the arithmetic never sees text. The backslash at the end of line 62 joins it to line 63, where `|| { ...; exit 2; }` prints "the port must be 1024 to 65535" and stops with code 2 if either test failed.
+- Line 64 checks the seat against `SEAT_PATTERN`. The variable is on the right side without quotes: that is how Bash knows it is a pattern and not a plain string.
+- Lines 65 and 66 check `times` the same way as the port: digits only, then `times >= 1 && times <= MAX_TIMES`.
+- Line 67 checks the key against `KEY_PATTERN`.
 
-So by line 54 the script knows the tool exists and the four values are safe. They cannot contain a quote, a space, a slash or a shell symbol, which matters because they are used inside a JSON body and a URL.
+So by line 68 the script knows the tool exists and the four values are safe. They cannot contain a quote, a space, a slash or a shell symbol, which matters because they are used inside a JSON body and a URL.
 
-### Building the request (lines 55 to 59)
+### Building the request (lines 69 to 73)
 
 ```bash
 body="{\"eventId\":1,\"seat\":\"$seat\",\"customer\":\"script\"}"
@@ -163,7 +189,7 @@ curl_command=(curl --silent --show-error --max-time "$CURL_TIMEOUT_SECONDS" \
   --data "$body" "http://127.0.0.1:$port/v1/holds")
 ```
 
-- Line 55 builds the JSON body: `{"eventId":1,"seat":"A-7","customer":"script"}`. The backslashes (`\"`) put a literal double quote inside a double-quoted string. `$seat` is replaced with the checked seat.
+- Line 69 builds the JSON body: `{"eventId":1,"seat":"A-7","customer":"script"}`. The backslashes (`\"`) put a literal double quote inside a double-quoted string. `$seat` is replaced with the checked seat.
 - `curl_command=( ... )` stores a **list** (an array) of words, one per element. Keeping the command as a list instead of one long string means a word with quotes or spaces stays one word later.
 - `curl --silent --show-error --max-time "$CURL_TIMEOUT_SECONDS"`: `--silent` hides curl's progress meter. `--show-error` still prints a real error, such as "connection refused". `--max-time 5` stops waiting after 5 seconds.
 - `--output /dev/stderr` sends the reply body to standard error instead of standard output, and `--write-out '%{http_code}'` makes curl print the status number to standard output at the end. That separates the two: the status can be captured as a value, and the body is caught separately in the loop below.
@@ -171,38 +197,44 @@ curl_command=(curl --silent --show-error --max-time "$CURL_TIMEOUT_SECONDS" \
 - `--data "$body"` makes the request a `POST` with that body.
 - `"http://127.0.0.1:$port/v1/holds"` is the address. It is fixed to the loopback address; only the port comes from the user.
 
-### The plan and the dry run (lines 60 to 66)
+### The plan and the dry run (lines 74 to 80)
 
 ```bash
 echo "plan: $times x POST http://127.0.0.1:$port/v1/holds, seat $seat, Idempotency-Key \"$key\""
 if [[ "$mode" == "dry-run" ]]; then
   echo "dry run: nothing sent. Each request would be:"
-  echo "  ${curl_command[*]}"
+  echo "  $(shell_quoted "${curl_command[@]}")"
   echo "add --run to send them"
   exit 0
 fi
 ```
 
-- Line 60 prints the plan in one line, for example `plan: 3 x POST http://127.0.0.1:8080/v1/holds, seat A-7, Idempotency-Key "k1"`.
+- Line 74 prints the plan in one line, for example `plan: 3 x POST http://127.0.0.1:8080/v1/holds, seat A-7, Idempotency-Key "k1"`.
 - `if [[ "$mode" == "dry-run" ]]; then ... fi` runs its body only in the default mode.
-- The body prints `dry run: nothing sent. Each request would be:`, then the command. `${curl_command[*]}` joins all the words of the list with spaces. The line only shows the command; it is not run.
+- The body prints `dry run: nothing sent. Each request would be:`, then the command. `"${curl_command[@]}"` hands every word of the list to `shell_quoted` as its own argument, and `$( ... )` puts what the function prints into the line. The result has its quotes back, so it can be pasted into a terminal and runs the same request. The line only shows the command; it is not run here. (An earlier version printed `${curl_command[*]}`, the words joined by spaces with no quotes, which a shell would split in the wrong places.)
 - `add --run to send them` tells the learner the next step.
 - `exit 0` stops the script. The dry run succeeded, and nothing left the machine.
 
-### The confirmation (lines 67 to 70)
+### The confirmation (lines 81 to 88)
 
 ```bash
 if [[ "$confirmed" != "yes" ]]; then
-  read -r -p "send $times requests to 127.0.0.1:$port? [y/N] " answer
+  # Without a terminal there is nobody to answer; with set -e a failed read would end the script
+  # silently, so the refusal is said out loud instead.
+  [[ -t 0 ]] || { echo "nothing sent: no terminal to confirm on; read the plan, then add --yes" >&2; exit 1; }
+  answer=""
+  read -r -p "send $times requests to 127.0.0.1:$port? [y/N] " answer || true
   [[ "$answer" == "y" ]] || { echo "nothing sent" >&2; exit 1; }
 fi
 ```
 
 - `if [[ "$confirmed" != "yes" ]]; then ... fi` asks the question unless `--yes` was given.
-- `read -r -p "send $times requests to 127.0.0.1:$port? [y/N] " answer` reads one line the person types into the variable `answer`. `-p` gives the prompt text; Bash shows it only when the input comes from a terminal. `-r` stops the shell from treating backslashes as special characters. The `[y/N]` in the prompt is a convention: the capital letter is the default, here No.
+- `[[ -t 0 ]]` tests whether standard input (file number 0) is a terminal, a keyboard and screen a person is at. If it is not (the input is a file, a pipe or `/dev/null`), nobody can answer, so the group after `||` prints `nothing sent: no terminal to confirm on; read the plan, then add --yes` and stops with code 1. The comment says why this is checked first: under `set -e`, a `read` that fails would end the script at once, with no message at all.
+- `answer=""` gives the variable a value before the question, so it is defined even if `read` reads nothing.
+- `read -r -p "send $times requests to 127.0.0.1:$port? [y/N] " answer || true` reads one line the person types into the variable `answer`. `|| true` keeps a failed read (the person pressed Ctrl-D, which ends the input) from stopping the script; the empty answer is then refused on the next line. `-p` gives the prompt text; Bash shows it only when the input comes from a terminal. `-r` stops the shell from treating backslashes as special characters. The `[y/N]` in the prompt is a convention: the capital letter is the default, here No.
 - `[[ "$answer" == "y" ]] || { echo "nothing sent" >&2; exit 1; }` accepts only the exact text `y`. Anything else, including an empty line, prints `nothing sent` and stops with code 1.
 
-### Sending the requests (lines 72 to 77)
+### Sending the requests (lines 90 to 95)
 
 ```bash
 mkdir -p "$AUDIT_DIR"
@@ -215,11 +247,11 @@ done
 
 - `mkdir -p "$AUDIT_DIR"` creates the folder `build/retry-hold` if it is missing. `-p` means it is not an error if it already exists.
 - `for attempt in $(seq 1 "$times"); do ... done`. `$(command)` runs a command and puts its output in the place of the `$(...)`. `seq 1 3` prints the numbers 1, 2 and 3, one per line. The loop runs once for each.
-- The comment on line 74 says why the curl command sends the body to standard error: so that "the body goes to stderr and the status to stdout, so each line shows both".
+- The comment on line 92 says why the curl command sends the body to standard error: so that "the body goes to stderr and the status to stdout, so each line shows both".
 - `status=$("${curl_command[@]}" 2> "$AUDIT_DIR/reply.json")` runs the saved command. `"${curl_command[@]}"` expands the list to its words, each kept whole. `2> file` sends standard error, which holds the body, into the file `build/retry-hold/reply.json`. What curl writes to standard output, the status number, becomes the value of `status`. Because of `set -e`, a failing curl (for example a server that is not running) ends the script here.
 - `echo "attempt $attempt: $status $(cat "$AUDIT_DIR/reply.json")"` prints one line per request: the attempt number, the status and the body that was saved. With the same key, all three lines show `201` and the same `holdId`.
 
-### The check after (lines 79 to 81)
+### The check after (lines 97 to 99)
 
 ```bash
 # Check after: the store must hold the key once, whatever the number of attempts.
@@ -231,7 +263,7 @@ curl --silent --show-error --max-time "$CURL_TIMEOUT_SECONDS" "http://127.0.0.1:
 - `curl ... "http://127.0.0.1:$port/metrics"` reads the server's metrics page, a plain-text list of counters. `|` is a **pipe**: it sends the output of the command on the left to the command on the right.
 - `grep -E '^seatwave_idempotency_(outcomes_total\{endpoint="POST /v1/holds"|keys_stored)'` keeps only the lines that start with one of two counter names. `-E` switches on extended regular expressions, where `( | )` means "either of these". `\{` is a literal brace. The two kept lines show how many replies were new and how many were replays for this endpoint, and how many keys the store holds. After three attempts you should see one `outcome="first"` and two `outcome="replayed"`, and `seatwave_idempotency_keys_stored 1`. (This is what the contract tests count, too; I did not run the live send, only the dry run.)
 
-### The audit line (lines 82 to 84)
+### The audit line (lines 100 to 102)
 
 ```bash
 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) sent $times holds of $seat with key $key to 127.0.0.1:$port" \
@@ -240,7 +272,7 @@ echo "audit line added to $AUDIT_DIR/audit.log"
 ```
 
 - `date -u +%Y-%m-%dT%H:%M:%SZ` prints the current time in UTC (`-u`) in the ISO 8601 format, for example `2026-11-11T09:00:00Z`.
-- `echo "..." >> "$AUDIT_DIR/audit.log"` appends one line. `>>` adds to the end of a file; a single `>` would replace the file. The backslash at the end of line 82 joins it to line 83, where the redirection is.
+- `echo "..." >> "$AUDIT_DIR/audit.log"` appends one line. `>>` adds to the end of a file; a single `>` would replace the file. The backslash at the end of line 100 joins it to line 101, where the redirection is.
 - The last `echo` tells the learner where the audit line went. The script then ends with the exit code of its last command, 0.
 
 ## Try it yourself
@@ -254,7 +286,13 @@ scripts/retry-hold.sh 8080 A-7 3 k1
 echo "exit=$?"
 ```
 
-   Output: `plan: 3 x POST http://127.0.0.1:8080/v1/holds, seat A-7, Idempotency-Key "k1"`, then `dry run: nothing sent. Each request would be:`, the command on one line starting with `  curl --silent --show-error --max-time 5 --output /dev/stderr --write-out %{http_code} -H Content-Type: application/json ...`, then `add --run to send them` and `exit=0`. The printed command has lost its quote marks (the shell took them out before `echo` printed the words), so it is a picture of the request and not a line to paste.
+   Output: `plan: 3 x POST http://127.0.0.1:8080/v1/holds, seat A-7, Idempotency-Key "k1"`, then `dry run: nothing sent. Each request would be:`, then the command on one line, then `add --run to send them` and `exit=0`. The command line was, with both shells:
+
+```text
+  curl --silent --show-error --max-time 5 --output /dev/stderr --write-out '%{http_code}' -H 'Content-Type: application/json' -H 'Idempotency-Key: "k1"' --data '{"eventId":1,"seat":"A-7","customer":"script"}' http://127.0.0.1:8080/v1/holds
+```
+
+   The quotes are back, so the line can be pasted. `RetryHoldScriptTest` checks that the shell reads it back as the same words.
 
 2. Refuse bad input, one case at a time:
 
@@ -276,13 +314,13 @@ scripts/retry-hold.sh 8080 A-7 3 k1 --bad; echo "exit=$?"
 
    Output: `usage: scripts/retry-hold.sh <port> <seat> <times> <key> [--run] [--yes]` and `exit=2` both times.
 
-4. Say no to the question (the answer comes from a pipe, so nothing is sent):
+4. Try to answer from a pipe instead of a terminal:
 
 ```
 echo n | scripts/retry-hold.sh 8080 A-7 3 k1 --run; echo "exit=$?"
 ```
 
-   Output: the `plan:` line, `nothing sent` and `exit=1`. The audit folder is not created: `ls build/retry-hold` says `No such file or directory`.
+   Output: the `plan:` line, `nothing sent: no terminal to confirm on; read the plan, then add --yes` and `exit=1`. A pipe is not a terminal, so the script does not even ask. The audit folder is not created: `ls build/retry-hold` says `No such file or directory`. To see the plain `nothing sent`, run the command without `echo n |` in a terminal and answer anything but `y`.
 
 5. See what happens when there is no terminal to ask:
 
@@ -290,7 +328,7 @@ echo n | scripts/retry-hold.sh 8080 A-7 3 k1 --run; echo "exit=$?"
 scripts/retry-hold.sh 8080 A-7 3 k1 --run < /dev/null; echo "exit=$?"
 ```
 
-   Output: the `plan:` line and `exit=1`, without the words `nothing sent`. The `read` command fails at the end of input, and `set -e` stops the script on the spot. Nothing is sent.
+   Output: the `plan:` line, `nothing sent: no terminal to confirm on; read the plan, then add --yes` and `exit=1`. Nothing is sent. (Before the `[[ -t 0 ]]` check, this printed only the plan: `read` failed at the end of input and `set -e` ended the script without a word.)
 
 6. Run it without `curl` on the path:
 

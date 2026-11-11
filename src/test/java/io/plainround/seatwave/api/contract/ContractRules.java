@@ -21,8 +21,9 @@ import java.util.Set;
 
 /**
  * The checks a SeatWave contract must pass before any code is written: the OpenAPI parser's own
- * validation (structure, types, references), then the house rules this module teaches. Used by the
- * build's tests and by the {@code lintContract} task.
+ * validation (structure, types, references), then the house rules this module teaches: errors are
+ * problem details, writes require an Idempotency-Key, pages have a ceiling and a cursor, and every
+ * required field is defined. Used by the build's tests and by the {@code lintContract} task.
  */
 public final class ContractRules {
 
@@ -98,6 +99,39 @@ public final class ContractRules {
     if (method == PathItem.HttpMethod.GET && returnsPage(responses)) {
       checkPagination(name, operation, problems);
     }
+    Optional.ofNullable(operation.getRequestBody())
+        .ifPresent(body -> checkRequiredFields(name + " request", body.getContent(), problems));
+    responses.forEach((status, response) ->
+        checkRequiredFields(name + " " + status, response.getContent(), problems));
+  }
+
+  private static void checkRequiredFields(String where, Content content, List<String> problems) {
+    Optional.ofNullable(content)
+        .ifPresent(mediaTypes ->
+            mediaTypes
+                .values()
+                .forEach(mediaType -> checkRequiredFields(where, mediaType.getSchema(), problems)));
+  }
+
+  private static void checkRequiredFields(String where, Schema<?> schema, List<String> problems) {
+    if (schema == null) {
+      return;
+    }
+    // The parser accepts a required name with no definition; a client cannot know what to send.
+    Set<String> defined =
+        schema.getProperties() == null ? Set.of() : schema.getProperties().keySet();
+    for (String required : Objects.requireNonNullElse(schema.getRequired(), List.<String>of())) {
+      if (!defined.contains(required)) {
+        problems.add("rule: " + where + ": required field " + required + " is not defined");
+      }
+    }
+    if (schema.getProperties() != null) {
+      schema
+          .getProperties()
+          .forEach(
+              (field, property) -> checkRequiredFields(where + "." + field, property, problems));
+    }
+    checkRequiredFields(where + "[]", schema.getItems(), problems);
   }
 
   private static void checkPagination(String name, Operation operation, List<String> problems) {

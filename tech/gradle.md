@@ -75,10 +75,10 @@ plugins {
 
 ```kotlin
 group = "io.plainround"
-version = "1.0.0"
+version = "1.1.0"
 ```
 
-`group` and `version` are the project's own identity in the Maven style: a group, a name (from `settings.gradle.kts`) and a version. They would matter if the project were published as a library. Here they only label the build. The version `1.0.0` is also the version of the contract the repository releases first (`openapi/released/seatwave-api-1.0.0.yaml`).
+`group` and `version` are the project's own identity in the Maven style: a group, a name (from `settings.gradle.kts`) and a version. They would matter if the project were published as a library. Here they only label the build. The version `1.1.0` is the project's second release (`CHANGELOG.md` lists what changed); the contract it serves is still the released `1.0.0` (`openapi/released/seatwave-api-1.0.0.yaml`), because the fixes changed no reply the contract describes.
 
 ### The Java toolchain
 
@@ -117,7 +117,6 @@ dependencies {
         testImplementation(libs.guava)
         testImplementation(libs.commons.configuration)
     }
-    testRuntimeOnly(libs.logback.classic)
     testRuntimeOnly(libs.junit.platform.launcher)
 }
 ```
@@ -136,7 +135,7 @@ A name like `implementation`, `runtimeOnly`, `testImplementation` or `testRuntim
 - `testImplementation(libs.awaitility)` adds Awaitility, which waits for a condition instead of sleeping (`awaitility.md`).
 - Lines 29 and 30 are comments: the validator reads the OpenAPI document and judges every reply; the diff compares the document with the last released one.
 - `testImplementation(libs.openapi.validator)` and `testImplementation(libs.openapi.diff)` add the two OpenAPI libraries (`openapi-validator-and-diff.md`). Both are test-only on purpose: the service itself never ships them. That is why the lint and diff tasks further down run from the test classpath.
-- `testRuntimeOnly(libs.logback.classic)` names the logging engine for the test runs. I checked that the tests would still see it without this line, because the test classpath already inherits the main code's `runtimeOnly` libraries, so the line only states the need again.
+- There is no `testRuntimeOnly(libs.logback.classic)`: the test classpath inherits the main code's `runtimeOnly` libraries, so Logback is there for the tests already. `./gradlew -q dependencies --configuration testRuntimeClasspath` lists `ch.qos.logback:logback-classic:1.6.6`.
 - `testRuntimeOnly(libs.junit.platform.launcher)` adds the JUnit Platform launcher, the piece Gradle calls to start the tests. Gradle 9 expects the project to declare it. It is needed only when tests run. Its version comes from the BOM.
 
 ### The constraints block
@@ -378,7 +377,7 @@ All commands below ran in a scratch copy of this repository on 11 November 2026 
 ./gradlew --offline clean check
 ```
 
-   It prints one `PASSED` line per test (70 in all), then `> Task :jacocoTestCoverageVerification`, `> Task :spotlessJavaCheck` and ends with `BUILD SUCCESSFUL in 10s` and `10 actionable tasks: 10 executed`.
+   It prints one `PASSED` line per test (89 in all), then `> Task :jacocoTestCoverageVerification`, `> Task :spotlessJavaCheck` and ends with `BUILD SUCCESSFUL in 11s` and `10 actionable tasks: 10 executed`.
 
 3. Run the contract lint:
 

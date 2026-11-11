@@ -414,7 +414,9 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class PaymentStandIn implements AutoCloseable {
 
   private static final int MAX_BODY_BYTES = 1_024;
+  private static final int OK = 200;
   private static final int CREATED = 201;
+  // A charge sent again with the same key answers 200 with the first charge, as providers do.
   private static final int REPLAYED = 200;
   private static final int BAD_REQUEST = 400;
   private static final int NOT_FOUND = 404;
@@ -436,7 +438,7 @@ public final class PaymentStandIn implements AutoCloseable {
 - The class comment lists the endpoints: `POST /v1/charges`, `POST /control/mode?mode=ok|charge_then_timeout|fail`, and `GET /control/ledger`. It says it keeps a ledger in memory, deduplicates by `Idempotency-Key` as real providers do, and moves no money.
 - "Thread-safe: the ledger is a concurrent map updated with one atomic `computeIfAbsent` per key, so two racing charges with one key capture once." This is the same idea as the database's primary key, done in memory.
 - `implements AutoCloseable` lets it sit in a `try (...)` and be stopped automatically.
-- The constants are HTTP status numbers. Two are worth a note: `REPLAYED = 200` also serves as the plain "OK" for the control replies (a naming nit). `SYSTEM_BACKLOG = 0` means the operating system chooses the size of the queue of waiting connections; `STOP_DELAY_SECONDS = 0` means stop at once.
+- The constants are HTTP status numbers. Two are worth a note: `OK = 200` and `REPLAYED = 200` are the same number with two meanings, so each has its own name. `REPLAYED` is the answer to a charge sent again with a known key (the comment says so: 200 with the first charge, as providers do); `OK` is the plain success of the two control endpoints. `SYSTEM_BACKLOG = 0` means the operating system chooses the size of the queue of waiting connections; `STOP_DELAY_SECONDS = 0` means stop at once.
 
 ```java
   private PaymentStandIn(
@@ -612,7 +614,7 @@ public final class PaymentStandIn implements AutoCloseable {
         chargesByKey
             .values()
             .forEach(charge -> byReference.merge(charge.reference(), 1L, Long::sum));
-        send(exchange, REPLAYED, json.write(ledgerOf(byReference)));
+        send(exchange, OK, json.write(ledgerOf(byReference)));
         return;
       }
       String query = Objects.requireNonNullElse(exchange.getRequestURI().getQuery(), "");
@@ -620,7 +622,7 @@ public final class PaymentStandIn implements AutoCloseable {
         for (StandInMode candidate : StandInMode.values()) {
           if (query.equals("mode=" + candidate.name().toLowerCase(Locale.ROOT))) {
             mode.set(candidate);
-            send(exchange, REPLAYED, "{\"mode\":\"" + query.substring("mode=".length()) + "\"}");
+            send(exchange, OK, "{\"mode\":\"" + query.substring("mode=".length()) + "\"}");
             return;
           }
         }
@@ -809,12 +811,16 @@ public final class Database implements AutoCloseable {
 - "Thread-safe: `connect()` may be called from any thread; each connection belongs to the thread that opened it until it is closed." A JDBC connection is not safe to share between threads, so each unit of work opens its own.
 
 ```java
-  // Applied in this order, each once. A new migration is appended, never edited after release.
+  // Applied in this order. A new migration is appended, never changed in what it creates after
+  // release. H2 commits each DDL statement at once, so a script and its schema_history row are
+  // separate commits: every statement is written to be safe to run again (IF NOT EXISTS), and a
+  // crash between the two makes the next start run the script again harmlessly, then record it.
   private static final List<String> MIGRATIONS =
       List.of(
           "V1__module_1_schema.sql",
           "V2__idempotency_and_payment.sql",
-          "V3__seat_order_for_cursors.sql");
+          "V3__seat_order_for_cursors.sql",
+          "V4__seats_by_hold.sql");
 
   private final String url;
   // An in-memory H2 database lives while one connection to it is open; this one keeps it alive.
@@ -826,7 +832,7 @@ public final class Database implements AutoCloseable {
   }
 ```
 
-- `MIGRATIONS` is a fixed list of file names, applied in this order. The comment is the rule: "A new migration is appended, never edited after release". The list position is the version number: V1 is index 0.
+- `MIGRATIONS` is a fixed list of four file names, applied in this order. The comment is the rule: a new migration is appended, and a released one is never changed in what it creates. It also explains why every statement in the scripts is written to be run again harmlessly: H2 commits each schema statement at once, so a script and the row that records it are two separate commits, and a crash between them makes the next start run the script a second time. The list position is the version number: V1 is index 0.
 - `url` is the H2 address. `anchor` is the connection that keeps an in-memory database alive (the comment).
 - The constructor is `private`; use `open`.
 
@@ -938,7 +944,7 @@ public final class Database implements AutoCloseable {
 - The loop goes through the list. `isApplied(connection, version)` looks for the version in `schema_history`; if found, `continue` skips it.
 - `statement.execute("RUNSCRIPT FROM 'classpath:/db/migration/" + MIGRATIONS.get(index) + "'")` is an H2 command that reads an SQL file and runs every statement in it. `classpath:` means "inside the program's own resources", so the migration files travel inside the program. The comment explains the string join is safe: the name is one of the constants above, never input.
 - Then `INSERT INTO schema_history (version, script) VALUES (?, ?)` records the version. On the next start the migration is skipped.
-- The migration runs and the record is written as two separate steps, on a connection in auto-commit mode. H2 commits a schema change as soon as it runs. If the process dies between the two, the schema has changed and the history does not say so. The next start would run the same script again and fail on `CREATE TABLE` because the table exists. I report this with the other findings; it is a small window, and the migrations only run at start-up in one process.
+- The migration runs and the record is written as two separate steps, on a connection in auto-commit mode. H2 commits a schema change as soon as it runs. If the process dies between the two, the schema has changed and the history does not say so. The next start runs the same script again. That is safe because every statement in the scripts is written to be run again (`CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS` and the like): the second run changes nothing, and then the row is written. `DatabaseTest` builds exactly that state, a migrated database with an empty history, and checks that it starts. The design chosen and the alternative rejected are in `ARCHITECTURE.md`.
 
 ```java
   private static boolean isApplied(Connection connection, int version) throws SQLException {
@@ -1141,11 +1147,12 @@ java -cp build/classes/java/main:build/resources/main:<path to h2-2.5.252.jar> M
 1 V1__module_1_schema.sql
 2 V2__idempotency_and_payment.sql
 3 V3__seat_order_for_cursors.sql
+4 V4__seats_by_hold.sql
 ```
 
-Run it a second time: the same three lines, and no migration runs again. If you leave out `build/resources/main` from the class path, `RUNSCRIPT` cannot find the SQL files and the program fails with `FileNotFoundException: resource /db/migration/V1__module_1_schema.sql`. That is how you see that the migrations travel as resources of the program.
+Run it a second time: the same four lines, and no migration runs again. If you leave out `build/resources/main` from the class path, `RUNSCRIPT` cannot find the SQL files and the program fails with `FileNotFoundException: resource /db/migration/V1__module_1_schema.sql`. That is how you see that the migrations travel as resources of the program.
 
-**5. Run the payment tests.** In a scratch copy: `./gradlew test --tests '*PaymentStandInTest*' --tests '*ConfirmPaymentTest*' --tests '*DatabaseTest*'`. On my machine 17 test methods printed `PASSED` and the build ended with `BUILD SUCCESSFUL`. The README reports the full run (`./gradlew clean check`, 70 tests on 11 November 2026).
+**5. Run the payment tests.** In a scratch copy: `./gradlew test --tests '*PaymentStandInTest*' --tests '*ConfirmPaymentTest*' --tests '*DatabaseTest*'`. On my machine 19 test methods printed `PASSED` (6, 8 and 5) and the build ended with `BUILD SUCCESSFUL`. The README reports the full run (`./gradlew clean check`, 89 tests on 11 November 2026).
 
 ## Mistakes people make
 

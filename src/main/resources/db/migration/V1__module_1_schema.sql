@@ -1,12 +1,12 @@
 -- Module 1's three tables, unchanged: the API in front of them changes, the rule inside them does not.
-CREATE TABLE events (
+CREATE TABLE IF NOT EXISTS events (
   event_id BIGINT PRIMARY KEY,
   name VARCHAR(120) NOT NULL,
   starts_at BIGINT NOT NULL
 );
 
 -- The status column is the single source of truth for a seat. Java never decides alone.
-CREATE TABLE seats (
+CREATE TABLE IF NOT EXISTS seats (
   event_id BIGINT NOT NULL,
   seat_label VARCHAR(16) NOT NULL,
   section VARCHAR(4) NOT NULL,
@@ -19,7 +19,7 @@ CREATE TABLE seats (
 );
 
 -- Second guard: even a bug in the confirm logic cannot create two bookings for one seat.
-CREATE TABLE bookings (
+CREATE TABLE IF NOT EXISTS bookings (
   booking_id VARCHAR(40) PRIMARY KEY,
   event_id BIGINT NOT NULL,
   seat_label VARCHAR(16) NOT NULL,
@@ -28,4 +28,4 @@ CREATE TABLE bookings (
   CONSTRAINT one_booking_per_seat UNIQUE (event_id, seat_label)
 );
 
-CREATE INDEX seats_by_section ON seats (event_id, section);
+CREATE INDEX IF NOT EXISTS seats_by_section ON seats (event_id, section);

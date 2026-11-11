@@ -56,7 +56,14 @@ The README states the choice: Jackson 2.x is used because the OpenAPI test tools
           // "1" and 1.5 are not the integer the contract asks for: no silent conversion.
           .disable(MapperFeature.ALLOW_COERCION_OF_SCALARS)
           .disable(DeserializationFeature.ACCEPT_FLOAT_AS_INT)
-          .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+          // The switch above covers numbers and booleans only; 5 or true is not a string either.
+          .withCoercionConfig(
+              LogicalType.Textual,
+              textual ->
+                  textual
+                      .setCoercion(CoercionInputShape.Integer, CoercionAction.Fail)
+                      .setCoercion(CoercionInputShape.Float, CoercionAction.Fail)
+                      .setCoercion(CoercionInputShape.Boolean, CoercionAction.Fail))
           .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
           .build();
 ```
@@ -68,7 +75,7 @@ Line by line:
 - `.enable(DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES)`: a JSON `null` for a Java `int`, `long` or `boolean` is an error. Without it, `null` becomes 0 or false in silence. (The request bodies of this API use the boxed types `Long` and `String`, so `null` arrives as `null` and the validation step names the field. The switch protects records with primitive fields.)
 - `.disable(MapperFeature.ALLOW_COERCION_OF_SCALARS)`: a string such as `"1"` is not accepted where a number is expected.
 - `.disable(DeserializationFeature.ACCEPT_FLOAT_AS_INT)`: `1.5` is not accepted for a whole number and is not rounded.
-- `.enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)`: after the first complete value, only white space may follow.
+- `.withCoercionConfig(LogicalType.Textual, ...)`: the switch above stops at number and boolean targets, so without this a number or `true` sent for a **string** field was turned into text in silence (`"customer":5` was stored as `"5"`). A **coercion** is such a silent conversion. `LogicalType.Textual` names the kind of target (text, such as `String`). Each `.setCoercion(shape, CoercionAction.Fail)` refuses one shape of input: `Integer` (`5`), `Float` (`1.5`) and `Boolean` (`true` or `false`). The refusal arrives as a `MismatchedInputException`, like any other wrong type.
 - `.enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)`: the same field name twice in one object is an error. This one is a stream feature, which is why it is `StreamReadFeature` and not `DeserializationFeature`.
 
 ### Reading
@@ -85,44 +92,79 @@ Line by line:
   public <T> Result<T, BindingProblem> read(String json, Class<T> type) {
     Objects.requireNonNull(json, "json");
     Objects.requireNonNull(type, "type");
-    try {
-      T value = mapper.readValue(json, type);
-      if (value == null) {
-        return Result.error(new BindingProblem("", "the body must be a JSON object"));
+    // The parser is driven by hand, so an empty body, a body that is not an object and data after
+    // the object each get their own message instead of one generic type error.
+    try (JsonParser parser = mapper.createParser(json)) {
+      JsonToken first = parser.nextToken();
+      if (first == null) {
+        return Result.error(
+            new BindingProblem(WHOLE_BODY, "the body is empty; send a JSON object"));
+      }
+      if (first != JsonToken.START_OBJECT) {
+        return Result.error(new BindingProblem(WHOLE_BODY, "the body must be a JSON object"));
+      }
+      T value = mapper.readValue(parser, type);
+      if (parser.nextToken() != null) {
+        return Result.error(
+            new BindingProblem(WHOLE_BODY, "the body has data after the JSON object"));
       }
       return Result.success(value);
     } catch (UnrecognizedPropertyException unknownField) {
       return Result.error(
           new BindingProblem(
-              "/" + unknownField.getPropertyName(), "is not a field of this request"));
+              "/" + escaped(unknownField.getPropertyName()), "is not a field of this request"));
     } catch (MismatchedInputException wrongType) {
       return Result.error(new BindingProblem(pointerOf(wrongType), "has the wrong type"));
+    } catch (JsonMappingException unbound) {
+      // 99999999999999999999 is valid JSON; it only does not fit the field's type.
+      if (unbound.getCause() instanceof InputCoercionException) {
+        return Result.error(
+            new BindingProblem(pointerOf(unbound), "is out of range for this field"));
+      }
+      return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
     } catch (JacksonException malformed) {
-      return Result.error(new BindingProblem("", "the body is not valid JSON"));
+      return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
+    } catch (IOException notReadable) {
+      // Every parse failure is a JacksonException; reading from a string has no other I/O to fail.
+      throw new UncheckedIOException("reading a string failed", notReadable);
     }
   }
 ```
 
-`mapper.readValue(json, type)` binds the text. The exceptions map to messages:
+`mapper.createParser(json)` makes a token reader over the text, and the method looks at the first token itself before any binding. That is how three problems of the whole body get their own message, each at the pointer `""` (in RFC 6901, the empty pointer is the whole document; `WHOLE_BODY` names it):
 
-- `UnrecognizedPropertyException` is an unknown field. The pointer is `/` plus the name, such as `/price`.
+- No token at all (`nextToken()` is `null`): "the body is empty; send a JSON object".
+- A first token that is not `{` (`JsonToken.START_OBJECT`), such as `[1]`, `5` or `null`: "the body must be a JSON object".
+- A second value after the object, such as `{...} {}`: "the body has data after the JSON object". `mapper.readValue(parser, type)` reads exactly one object, and the next `nextToken()` must find nothing. This check replaces the switch `FAIL_ON_TRAILING_TOKENS`, whose error could not be told apart from a type error.
+
+The exceptions map to messages:
+
+- `UnrecognizedPropertyException` is an unknown field. The pointer is `/` plus the escaped name, such as `/price`.
 - `MismatchedInputException` is a value of the wrong type. The pointer is built from the path Jackson was reading.
-- `JacksonException` is the parent of every Jackson failure (broken syntax, a repeated field, a number too large for its type). The pointer is `""` (the whole body) and the message is "the body is not valid JSON".
-- A `null` result means the text was the JSON value `null`.
+- `JsonMappingException` with an `InputCoercionException` as its cause is a number that is valid JSON text but too large for its field, such as `99999999999999999999` for a `Long`. The pointer is the field's, and the message is "is out of range for this field".
+- `JacksonException` is the parent of every other Jackson failure (broken syntax, a repeated field). The pointer is `""` and the message is "the body is not valid JSON".
+- A plain `IOException` cannot happen when the input is a string, so it is rethrown unchecked as a bug.
 
 The order of the `catch` blocks goes from the most specific exception to the most general.
 
 ```java
-  private static String pointerOf(MismatchedInputException wrongType) {
+  private static String pointerOf(JsonMappingException failure) {
     // RFC 6901 pointer: "/field" for each step of the path Jackson was reading.
-    return wrongType.getPath().stream()
+    return failure.getPath().stream()
         .map(step ->
-            step.getFieldName() == null ? String.valueOf(step.getIndex()) : step.getFieldName())
+            step.getFieldName() == null
+                ? String.valueOf(step.getIndex())
+                : escaped(step.getFieldName()))
         .collect(Collectors.joining("/", "/", ""));
+  }
+
+  private static String escaped(String fieldName) {
+    // RFC 6901: "~" and "/" inside a name are written "~0" and "~1", in this order.
+    return fieldName.replace("~", "~0").replace("/", "~1");
   }
 ```
 
-`getPath()` returns the steps from the root to the failing value. A step has a field name, or an array index. `Collectors.joining("/", "/", "")` writes the JSON pointer of RFC 6901. A failure at the root has no steps and so gives `/`.
+`getPath()` returns the steps from the root to the failing value. A step has a field name, or an array index. `Collectors.joining("/", "/", "")` writes the JSON pointer of RFC 6901. Problems of the whole body never get here: `read` reports them at `""` first. `escaped` applies RFC 6901's two escapes inside a name: `~` becomes `~0`, then `/` becomes `~1`, so a field named `a/b` is `/a~1b` and not a field `b` inside `a`.
 
 ### Writing
 
@@ -194,14 +236,14 @@ Command shape (replace the body):
 | `{"eventId":true,"seat":"D-1","customer":"fan_1"}` | pointer `/eventId`, "has the wrong type" |
 | `{"eventId":1,"seat":["D-1"],"customer":"fan_1"}` | pointer `/seat`, "has the wrong type" |
 | `{"eventId":1,"eventId":2,"seat":"A-7","customer":"fan_7"}` | pointer empty, "the body is not valid JSON" |
-| `{"eventId":1,"seat":"A-7","customer":"fan_7"} {}` | pointer `/`, "has the wrong type" |
+| `{"eventId":1,"seat":"A-7","customer":"fan_7"} {}` | pointer empty, "the body has data after the JSON object" |
 | `{"eventId":1,"seat":"D-1","customer":"fan_1",}` | pointer empty, "the body is not valid JSON" |
 | `{"eventId":null,"seat":"A-7","customer":"fan_7"}` | pointer `/eventId`, "is required: a whole number of 1 or more" |
 | `null` | pointer empty, "the body must be a JSON object" |
-| `[1]` | pointer `/`, "has the wrong type" |
-| `{"eventId":99999999999999999999,"seat":"D-1","customer":"fan_1"}` | pointer empty, "the body is not valid JSON" (the number is valid JSON text but does not fit a `Long`; the reply uses the generic message) |
-
-Two results are worth noticing, because they show where the switches stop. A number sent for a **string** field is accepted: `{"eventId":1,"seat":"D-1","customer":5}` created a hold for the customer `"5"`. `ALLOW_COERCION_OF_SCALARS` guards the number targets I tried (the `eventId` rows above), and I did not find a switch in this configuration that makes a string field refuse a number. The field is still checked by the customer pattern afterwards.
+| `[1]` | pointer empty, "the body must be a JSON object" |
+| `{"eventId":99999999999999999999,"seat":"D-1","customer":"fan_1"}` | pointer `/eventId`, "is out of range for this field" (the number is valid JSON text but does not fit a `Long`) |
+| `{"eventId":1,"seat":"D-1","customer":5}` | pointer `/customer`, "has the wrong type" (a number for a string field, refused by the coercion configuration) |
+| an empty body (`--data-binary ''`) | pointer empty, "the body is empty; send a JSON object" |
 
 And a writer's view: the same hold sent with the fields in another order and extra spaces gets the identical stored reply, because the fingerprint is taken from the record written back out by `JsonCodec.write` (see `java-http-walkthrough.md`).
 
@@ -226,7 +268,7 @@ And a writer's view: the same hold sent with the fields in another order and ext
 4. Why does `HoldRequestBody` use `Long` and not `long`?
    Answer: so a missing field is `null` and can be reported as "is required"; a `long` would turn a missing field into 0.
 5. What JSON pointer does a type error in the field `eventId` get, and what pointer does a body with trailing data get?
-   Answer: `/eventId` for the field; `/` for trailing data, because the path is empty.
+   Answer: `/eventId` for the field; the empty pointer `""` for trailing data, which in RFC 6901 means the whole document.
 
 ## Further reading
 

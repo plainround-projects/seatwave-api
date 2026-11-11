@@ -4,6 +4,7 @@ import io.swagger.parser.OpenAPIParser;
 import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.Operation;
 import io.swagger.v3.oas.models.PathItem;
+import io.swagger.v3.oas.models.media.Content;
 import io.swagger.v3.oas.models.media.MediaType;
 import io.swagger.v3.oas.models.media.Schema;
 import io.swagger.v3.oas.models.parameters.Parameter;
@@ -14,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.BiConsumer;
 
 /**
  * The house breaking-change check, next to openapi-diff: a candidate contract breaks a released one
@@ -22,10 +24,14 @@ import java.util.Optional;
  *
  * <ul>
  *   <li>no operation and no documented status code disappears;
- *   <li>no response field disappears, changes type or stops being required;
+ *   <li>no response field disappears, changes type or stops being required, and no response gains
+ *       an allowed value (a client that switches over the known values has no branch for it);
  *   <li>no request field disappears (a client sends it, and unknown fields are refused) or changes
  *       type, no new request field or parameter is required, and no allowed value is removed.
  * </ul>
+ *
+ * <p>A removed response value is not on the list: a client never fails because a value stops
+ * arriving. Each media type is compared with the same media type of the candidate, by name.
  */
 public final class BreakingChanges {
 
@@ -77,14 +83,13 @@ public final class BreakingChanges {
                   next.getSchema(),
                   breaks));
     }
-    Optional.ofNullable(before.getRequestBody())
-        .map(body -> jsonSchema(body.getContent()))
-        .flatMap(schema -> schema)
-        .ifPresent(oldSchema ->
-            Optional.ofNullable(after.getRequestBody())
-                .flatMap(body -> jsonSchema(body.getContent()))
-                .ifPresent(
-                    newSchema -> compareRequest(name + " request", oldSchema, newSchema, breaks)));
+    if (before.getRequestBody() != null && after.getRequestBody() != null) {
+      compareContent(
+          before.getRequestBody().getContent(),
+          after.getRequestBody().getContent(),
+          (oldSchema, newSchema) ->
+              compareRequest(name + " request", oldSchema, newSchema, breaks));
+    }
     Map<String, ApiResponse> newResponses = mapOf(after.getResponses());
     mapOf(before.getResponses())
         .forEach((status, response) -> {
@@ -93,11 +98,11 @@ public final class BreakingChanges {
             breaks.add(name + ": response " + status + " was removed");
             return;
           }
-          jsonSchema(response.getContent())
-              .ifPresent(oldSchema ->
-                  jsonSchema(next.getContent())
-                      .ifPresent(newSchema ->
-                          compareResponse(name + " " + status, oldSchema, newSchema, breaks)));
+          compareContent(
+              response.getContent(),
+              next.getContent(),
+              (oldSchema, newSchema) ->
+                  compareResponse(name + " " + status, oldSchema, newSchema, breaks));
         });
   }
 
@@ -110,6 +115,13 @@ public final class BreakingChanges {
     for (String required : listOf(before.getRequired())) {
       if (!listOf(after.getRequired()).contains(required)) {
         breaks.add(where + ": field " + required + " is no longer always present");
+      }
+    }
+    if (before.getEnum() != null) {
+      for (Object allowed : listOf(after.getEnum())) {
+        if (!before.getEnum().contains(allowed)) {
+          breaks.add(where + ": the value " + allowed + " is new, so clients may not know it");
+        }
       }
     }
     mapOf(before.getProperties())
@@ -159,14 +171,17 @@ public final class BreakingChanges {
         .map(item -> item.readOperationsMap().get(method));
   }
 
-  private static Optional<Schema<?>> jsonSchema(io.swagger.v3.oas.models.media.Content content) {
-    if (content == null) {
-      return Optional.empty();
-    }
-    return content.values().stream()
-        .findFirst()
-        .map(MediaType::getSchema)
-        .map(schema -> (Schema<?>) schema);
+  private static void compareContent(
+      Content before, Content after, BiConsumer<Schema<?>, Schema<?>> comparison) {
+    // A client reads the media type it asked for, so each one is compared with its namesake; a
+    // reply with two media types must not be judged by whichever the document lists first.
+    mapOf(before)
+        .forEach((mediaType, released) -> {
+          MediaType candidate = mapOf(after).get(mediaType);
+          if (candidate != null && released.getSchema() != null && candidate.getSchema() != null) {
+            comparison.accept(released.getSchema(), candidate.getSchema());
+          }
+        });
   }
 
   private static String typeOf(Schema<?> schema) {

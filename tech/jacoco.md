@@ -8,7 +8,7 @@ JaCoCo works with a **Java agent**: a small jar that the Java Virtual Machine (J
 
 ## Why this repository uses it
 
-The build has a measured floor: line coverage must be at least 0.80, and the build fails below it. That keeps the tests honest as the code grows. The README reports "line coverage 85.9 percent (1,935 of 2,252 lines)".
+The build has a measured floor: line coverage must be at least 0.80, and the build fails below it. That keeps the tests honest as the code grows. The README reports "line coverage 86.2 percent (1,979 of 2,297 lines)".
 
 ## Where it appears
 
@@ -93,39 +93,39 @@ tasks.check {
 }
 ```
 
-`counter = "LINE"` picks the line counter. `minimum = "0.80".toBigDecimal()` is the lowest accepted ratio of covered lines to all lines. The comment above it names the untested remainder: the command-line entry points. `tasks.check { dependsOn(...) }` makes the rule part of `check`. When I raised the minimum to 0.95 in a scratch copy, the build failed with `Rule violated for bundle seatwave-api: lines covered ratio is 0.85, but expected minimum is 0.95`.
+`counter = "LINE"` picks the line counter. `minimum = "0.80".toBigDecimal()` is the lowest accepted ratio of covered lines to all lines. The comment above it names the untested remainder: the command-line entry points. `tasks.check { dependsOn(...) }` makes the rule part of `check`. When I raised the minimum to 0.95 in a scratch copy, the build failed with `Rule violated for bundle seatwave-api: lines covered ratio is 0.86, but expected minimum is 0.95`.
 
-### The real numbers (Temurin 25.0.2, 70 tests)
+### The real numbers (Temurin 25.0.2, 89 tests)
 
 I ran `./gradlew clean check` in a scratch copy and read `build/reports/jacoco/test/jacocoTestReport.xml` and the HTML report. The last row of the HTML table, "Total", reads:
 
 | Counter | Missed | Total | Covered |
 | --- | --- | --- | --- |
-| Instructions | 1,657 | 11,601 | 85 percent (9,944 covered) |
-| Branches | 179 | 629 | 71 percent (450 covered) |
-| Lines | 317 | 2,252 | 1,935 lines, 85.9 percent |
-| Methods | 21 | 387 | 366 |
+| Instructions | 1,648 | 11,757 | 85 percent (10,109 covered) |
+| Branches | 177 | 645 | 72 percent (468 covered) |
+| Lines | 318 | 2,297 | 1,979 lines, 86.2 percent |
+| Methods | 21 | 389 | 368 |
 | Classes | 5 | 114 | 109 |
-| Complexity | 167 | 709 | 542 |
+| Complexity | 165 | 719 | 554 |
 
-The rule needs 0.80 of 2,252 lines, which is 1,801.6, so at least 1,802 covered lines. The build has 1,935. **The margin is 133 lines.** The README's figures (70 tests, 85.9 percent, 1,935 of 2,252) match this run.
+The rule needs 0.80 of 2,297 lines, which is 1,837.6, so at least 1,838 covered lines. The build has 1,979. **The margin is 141 lines.** The README's figures (89 tests, 86.2 percent, 1,979 of 2,297) match this run.
 
 Per package, the missed lines (from the XML report, class by class):
 
 | Package | Missed lines | Total lines | Where |
 | --- | --- | --- | --- |
 | `api` (the root package) | 36 | 68 | All 25 lines of `ServeCli` (the server that runs until stopped) and 11 in `SeatWaveApi`. |
-| `config` | 10 | 123 | Five in `ApiSettings`, three in `SettingsReader`, and one each in the `Seed` and `Payment` records. |
+| `config` | 11 | 139 | Five in `ApiSettings`, three in `SettingsReader`, two in the `Payment` record and one in the `Seed` record. |
 | `store` | 6 | 84 | Three in `Database` and three in `DemoSeed`. |
-| `idempotency` | 7 | 109 | Four in `IdempotencyStore`, two in `ClaimResult`, one in `StoredReply`. |
+| `idempotency` | 8 | 121 | Five in `IdempotencyStore`, two in `Fingerprint`, one in `StoredReply`. |
 | `catalog` | 6 | 181 | Five in `CatalogService` and one in `SeatFilter`. |
-| `booking` | 32 | 318 | 27 in `ConfirmService` (25 plus 2 in its inner class), three in `HoldCommand`, one in `HoldId` and one in `HoldService`. |
+| `booking` | 32 | 318 | 25 in `ConfirmService`, three in `HoldCommand`, two in `HoldService`, one each in `HoldId` and `SeatLedger`. |
 | `payment` | 35 | 186 | All 24 lines of `PaymentStandInCli`, nine in `PaymentClient` and two in `PaymentStandIn`. |
-| `http` | 28 | 717 | Nine in `Version0Routes`, six in `ApiServer`, five in `BookingRoutes`, four in `Parameters`, three in `Version0Views` and one in a nested class. |
-| `json` | 3 | 34 | Three in `JsonCodec`. |
+| `http` | 24 | 714 | Nine in `Version0Routes`, six in `ApiServer` and one in its nested class `Route`, five in `BookingRoutes` and three in `Parameters`. |
+| `json` | 6 | 54 | Six in `JsonCodec`. |
 | `load` | 154 | 432 | `RetryStormCli` 57, `PageWalkCli` 46, `KeyStoreSizeCli` 44 (all of these are the command-line classes), then five in `RetryStorm` and one each in `PageWalk` and `Latencies`. |
 
-The command-line entry points explain most of the gap: `ServeCli` 25, `PaymentStandInCli` 24, `RetryStormCli` 57, `PageWalkCli` 46 and `KeyStoreSizeCli` 44 make 196 of the 317 missed lines. `Classes` shows 5 missed of 114, and they are exactly those five. The other 121 missed lines are spread over the classes in the table, mostly one to nine lines each; I did not read each one.
+The command-line entry points explain most of the gap: `ServeCli` 25, `PaymentStandInCli` 24, `RetryStormCli` 57, `PageWalkCli` 46 and `KeyStoreSizeCli` 44 make 196 of the 318 missed lines. `Classes` shows 5 missed of 114, and they are exactly those five. The other 122 missed lines are spread over the classes in the table, mostly one to nine lines each; I did not read each one.
 
 ### Reading the report
 
@@ -141,7 +141,7 @@ All of these ran in a scratch copy on 11 November 2026. Timings differ on every 
 ./gradlew clean check
 ```
 
-   Expected: 70 `PASSED` lines, `> Task :jacocoTestCoverageVerification`, `BUILD SUCCESSFUL in 10s` and `10 actionable tasks: 10 executed`.
+   Expected: 89 `PASSED` lines, `> Task :jacocoTestCoverageVerification`, `BUILD SUCCESSFUL in 11s` and `10 actionable tasks: 10 executed`.
 
 2. Print the totals from the HTML report:
 
@@ -149,7 +149,7 @@ All of these ran in a scratch copy on 11 November 2026. Timings differ on every 
 grep -o '<tfoot>.*</tfoot>' build/reports/jacoco/test/html/index.html | sed 's/<[^>]*>/ /g'
 ```
 
-   Expected: `Total  1,657 of 11,601  85%  179 of 629  71%  167  709  317  2,252  21  387  5  114`.
+   Expected: `Total  1,648 of 11,757  85%  177 of 645  72%  165  719  318  2,297  21  389  5  114`.
 
 3. Print the total line counter from the XML report:
 
@@ -157,7 +157,7 @@ grep -o '<tfoot>.*</tfoot>' build/reports/jacoco/test/html/index.html | sed 's/<
 grep -o '<counter type="LINE"[^>]*>' build/reports/jacoco/test/jacocoTestReport.xml | tail -1
 ```
 
-   Expected: `<counter type="LINE" missed="317" covered="1935"/>`.
+   Expected: `<counter type="LINE" missed="318" covered="1979"/>`.
 
 4. Print the totals of the `load` package:
 
@@ -183,16 +183,16 @@ ls build/jacoco build/reports/jacoco/test build/reports/jacoco/test/html
 - **Chasing 100 percent for `main` methods.** The build documents them as the untested remainder instead (here `ServeCli`, `PaymentStandInCli`, `RetryStormCli`, `PageWalkCli` and `KeyStoreSizeCli`).
 - **Running only `./gradlew test` and expecting the rule to be checked.** The rule runs in `jacocoTestCoverageVerification`, which `check` runs.
 - **Reading an old report.** The report is rewritten after each `test` run; run the tests first.
-- **Forgetting the margin.** There are 133 lines of headroom now, but every untested line uses some of it, so new code still needs tests in the same change.
+- **Forgetting the margin.** There are 141 lines of headroom now, but every untested line uses some of it, so new code still needs tests in the same change.
 - **Deleting a test to make a number look right.** The check then fails for the right reason.
 
 ## Check yourself
 
 1. *What does the line counter measure?* The share of source lines in which at least one instruction ran during the tests.
 2. *Which task checks the rule and which writes the reports?* `jacocoTestCoverageVerification` checks; `jacocoTestReport` writes the HTML and the XML.
-3. *Why is coverage 85.9 percent and not 100?* The command-line classes are never run by a test (196 of the 317 missed lines), and the rest are lines in other classes that no test reaches.
+3. *Why is coverage 86.2 percent and not 100?* The command-line classes are never run by a test (196 of the 318 missed lines), and the rest are lines in other classes that no test reaches.
 4. *What makes the rule part of `check`?* `tasks.check { dependsOn(tasks.jacocoTestCoverageVerification) }`.
-5. *How many lines of headroom are there?* 133: 1,935 covered against 1,802 required.
+5. *How many lines of headroom are there?* 141: 1,979 covered against 1,838 required.
 
 ## Further reading
 

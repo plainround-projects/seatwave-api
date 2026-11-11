@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "io.plainround"
-version = "1.0.0"
+version = "1.1.0"
 
 java {
     toolchain {
@@ -35,7 +35,6 @@ dependencies {
         testImplementation(libs.guava)
         testImplementation(libs.commons.configuration)
     }
-    testRuntimeOnly(libs.logback.classic)
     testRuntimeOnly(libs.junit.platform.launcher)
 }
 

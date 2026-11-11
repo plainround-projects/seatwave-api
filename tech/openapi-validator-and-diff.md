@@ -277,10 +277,14 @@ For the breaking example, the library listed one changed operation, `POST /v1/ho
  *
  * <ul>
  *   <li>no operation and no documented status code disappears;
- *   <li>no response field disappears, changes type or stops being required;
+ *   <li>no response field disappears, changes type or stops being required, and no response gains
+ *       an allowed value (a client that switches over the known values has no branch for it);
  *   <li>no request field disappears (a client sends it, and unknown fields are refused) or changes
  *       type, no new request field or parameter is required, and no allowed value is removed.
  * </ul>
+ *
+ * <p>A removed response value is not on the list: a client never fails because a value stops
+ * arriving. Each media type is compared with the same media type of the candidate, by name.
  */
 public final class BreakingChanges {
 ```
@@ -289,14 +293,17 @@ The class Javadoc lists the rules. They are the ones Module 7 teaches. Written a
 
 | Rule | Message the code prints | Where | Exercised by |
 | --- | --- | --- | --- |
-| An operation disappears | `GET /v1/bookings/{bookingId}: the operation was removed` | `find`, line 52 | `refusesARemovedOperationAndARemovedAllowedValue` |
-| A documented status code disappears | `... response 404 was removed` | `compare`, line 93 | no test names it directly (the rule is in the code and the Javadoc) |
-| A response field or the response type changes or disappears | `field state was removed`, `type changed from X to Y` | `compareResponse`, lines 106 to 123 | `refusesARenamedResponseFieldAndANewRequiredRequestField` |
-| A response field stops being required (a client can no longer count on it) | `field state is no longer always present` | `compareResponse`, line 112 | same test (the rename removes `state` from `required`) |
-| A new required request field | `field channel is newly required` | `compareRequest`, line 137 | same test |
-| A request field disappears or changes type (clients that send it would be refused, because unknown fields are refused) | `field X was removed, so clients that send it fail` | `compareRequest`, line 149 | not named by a test |
-| A new required parameter | `new required parameter X` | `compare`, line 66 | not named by a test |
-| A value is removed from an allowed set (an `enum`) | `the value held is no longer allowed` | `compareRequest`, line 142 | `refusesARemovedOperationAndARemovedAllowedValue` |
+| An operation disappears | `GET /v1/bookings/{bookingId}: the operation was removed` | `find`, line 58 | `refusesARemovedOperationAndARemovedAllowedValue` |
+| A documented status code disappears | `POST /v1/holds: response 422 was removed` | `compare`, line 98 | `refusesARemovedStatusARemovedRequestFieldAndANewRequiredParameter` |
+| A response field or the response type changes or disappears | `field state was removed`, `type changed from X to Y` | `compareResponse`, lines 111 to 135 | `refusesARenamedResponseFieldAndANewRequiredRequestField` |
+| A response field stops being required (a client can no longer count on it) | `field state is no longer always present` | `compareResponse`, line 117 | same test (the rename removes `state` from `required`) |
+| A response gains an allowed value (a client that switches over the known values has no branch for it) | `the value sold is new, so clients may not know it` | `compareResponse`, line 123 | `refusesANewResponseValueButAcceptsARemovedOne` |
+| A new required request field | `field channel is newly required` | `compareRequest`, line 149 | same test as the rename |
+| A request field disappears or changes type (clients that send it would be refused, because unknown fields are refused) | `field customer was removed, so clients that send it fail` | `compareRequest`, line 161 | `refusesARemovedStatusARemovedRequestFieldAndANewRequiredParameter` |
+| A new required parameter | `new required parameter X-Client` | `compare`, line 72 | the same test |
+| A value is removed from a request's allowed set (an `enum`) | `the value held is no longer allowed` | `compareRequest`, line 154 | `refusesARemovedOperationAndARemovedAllowedValue` |
+
+Two choices in the list are deliberate. A value removed from a **response** enum is not breaking: a client never fails because a value stops arriving, and openapi-diff judges it the same way (`refusesANewResponseValueButAcceptsARemovedOne` checks both). And every schema is compared media type by media type, by name (`compareContent`), so a reply that lists two media types is never judged by whichever one the document happens to list first (`comparesEachMediaTypeWithTheSameOneByName`).
 
 `BreakingChangeTest` also runs the rules on the current contract against the released one and on the additive example, and expects an empty list both times. The full walkthrough of the file is in `tests-contract-walkthrough.md`.
 
@@ -331,7 +338,7 @@ The class Javadoc lists the rules. They are the ones Module 7 teaches. Written a
   }
 ```
 
-`ContractRules.check` is the **lint**: checks on one document, without a released one. It reads the text with the Swagger Parser (`new OpenAPIParser().readContents(text, null, options)`) with `setResolveFully(true)`, which means every `$ref` is replaced by the definition it points at, so each rule sees the final shape a client sees. Parser messages come first, then the house rules: the document must be OpenAPI 3.1, and every operation must be checked by `checkOperation`. The rules there are: a unique `operationId`; every 4xx and 5xx response is `application/problem+json` with `type`, `title` and `status` required; every `POST` with a body requires an `Idempotency-Key` header; every `GET` that returns a page has a `limit` with a maximum of at most 500 and a `cursor` parameter. Deprecated operations (version 0) are skipped on purpose.
+`ContractRules.check` is the **lint**: checks on one document, without a released one. It reads the text with the Swagger Parser (`new OpenAPIParser().readContents(text, null, options)`) with `setResolveFully(true)`, which means every `$ref` is replaced by the definition it points at, so each rule sees the final shape a client sees. Parser messages come first, then the house rules: the document must be OpenAPI 3.1, and every operation must be checked by `checkOperation`. The rules there are: a unique `operationId`; every 4xx and 5xx response is `application/problem+json` with `type`, `title` and `status` required; every `POST` with a body requires an `Idempotency-Key` header; every `GET` that returns a page has a `limit` with a maximum of at most 500 and a `cursor` parameter; and every name in a schema's `required` list is defined in its `properties` (the parser accepts a required name that is never defined, but a client cannot know what to send). Deprecated operations (version 0) are skipped on purpose.
 
 ## Try it yourself
 
@@ -351,7 +358,7 @@ All ran in a scratch copy on 11 November 2026. The contract tools exit with 3 wh
 ./gradlew --offline -q lintContract --args='openapi/examples/holds-entry-broken.yaml'
 ```
 
-   Output: `openapi/examples/holds-entry-broken.yaml: 4 problem(s)`, then two lines starting `parser:` (a missing `Hold` schema) and two starting `rule:` (`POST /v1/holds 409 must be application/problem+json Problem` and `POST /v1/holds creates something, so it must require Idempotency-Key`), then Gradle's `finished with non-zero exit value 3`.
+   Output: `openapi/examples/holds-entry-broken.yaml: 5 problem(s)`, then two lines starting `parser:` (a missing `Hold` schema, reported twice) and three starting `rule:` (`POST /v1/holds 409 must be application/problem+json Problem`, `POST /v1/holds creates something, so it must require Idempotency-Key` and `POST /v1/holds request: required field customer is not defined`), then Gradle's `finished with non-zero exit value 3`. Five lines for the draft's four mistakes.
 
 3. Diff the released contract against the breaking example:
 

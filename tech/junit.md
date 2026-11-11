@@ -8,7 +8,7 @@ An **annotation** is a label written with `@` in front of a method, class or par
 
 ## Why this repository uses it
 
-The project's tests double as its requirements: every test method has a long name that states one behavior in plain words, and all 70 run with `./gradlew check`. JUnit gives the structure. AssertJ (`assertj.md`) gives the readable checks and Awaitility (`awaitility.md`) the waiting. This module is about API design, so many tests start a real API and a stand-in payment provider on the loopback address and talk to them over HTTP, or attack one hold with 100 retries at once; JUnit only has to start the test and notice whether it returned or threw.
+The project's tests double as its requirements: every test method has a long name that states one behavior in plain words, and all 89 run with `./gradlew check`. JUnit gives the structure. AssertJ (`assertj.md`) gives the readable checks and Awaitility (`awaitility.md`) the waiting. This module is about API design, so many tests start a real API and a stand-in payment provider on the loopback address and talk to them over HTTP, or attack one hold with 100 retries at once; JUnit only has to start the test and notice whether it returned or threw.
 
 ## Where it appears
 
@@ -17,7 +17,7 @@ The project's tests double as its requirements: every test method has a long nam
 | `gradle/libs.versions.toml` | `junit = "6.1.3"` and the entries `junit-bom`, `junit-jupiter` and `junit-platform-launcher`. |
 | `build.gradle.kts` | `platform(libs.junit.bom)`, `libs.junit.jupiter` and `libs.junit.platform.launcher`, and `useJUnitPlatform()`. |
 | `gradle.lockfile` | Locks the JUnit libraries at 6.1.3 (`dependency-locking.md`). |
-| `src/test/java/**` | 16 test classes with 70 `@Test` methods, and 10 other classes that hold no tests (the helpers `TestApi`, `Contract`, `MutableClock`, `HttpStatus`, `AllAtOnce`, `FailingKeyWrite`, the contract tools `ContractRules`, `BreakingChanges` and the two `*Cli` classes). |
+| `src/test/java/**` | 19 test classes with 89 `@Test` methods, and 10 other classes that hold no tests (the helpers `TestApi`, `Contract`, `MutableClock`, `HttpStatus`, `AllAtOnce`, `FailingKeyWrite`, the contract tools `ContractRules`, `BreakingChanges` and the two `*Cli` classes). |
 
 ## How it works underneath
 
@@ -165,7 +165,7 @@ All ran in a scratch copy on 11 November 2026. Timings differ on every run.
 ./gradlew --offline cleanTest test | grep -c PASSED
 ```
 
-   Output: `70`. (`cleanTest` forces the tests to run again instead of being skipped as up to date.)
+   Output: `89`. (`cleanTest` forces the tests to run again instead of being skipped as up to date.)
 
 2. Run one class:
 
@@ -189,7 +189,7 @@ All ran in a scratch copy on 11 November 2026. Timings differ on every run.
 grep -rhoE "^ *@[A-Za-z]+" src/test | sed 's/^ *//' | sort | uniq -c
 ```
 
-   Output: `5 @AfterEach`, `5 @BeforeEach`, `5 @Override` and `70 @Test`. (`@TempDir` sits inside a method signature, so this pattern does not show it; `grep -rn "@TempDir" src/test` finds the one use, in `DatabaseTest.java` line 27.)
+   Output: `5 @AfterEach`, `5 @BeforeEach`, `5 @Override` and `89 @Test`. (`@TempDir` sits inside a method signature, so this pattern does not show it; `grep -rn "@TempDir" src/test` finds its three uses: `ApiSettingsTest.java` line 97 and `DatabaseTest.java` lines 28 and 68.)
 
 5. Read the totals from the result files:
 
@@ -197,7 +197,7 @@ grep -rhoE "^ *@[A-Za-z]+" src/test | sed 's/^ *//' | sort | uniq -c
 grep -o 'tests="[0-9]*"' build/test-results/test/*.xml
 ```
 
-   Each of the 16 files has a `tests="..."` count after a full run: 8 (`ConfirmPaymentTest`), 9 (`HoldRetryTest`), 3 (`CursorsTest`), 3 (`PaginationConsistencyTest`), 5 (`ApiSettingsTest`), 4 (`BreakingChangeTest`), 9 (`ContractConformanceTest`), 5 (`OpenApiDocumentTest`), 2 (`ApiServerTest`), 5 (`Version0CompatibilityTest`), 3 (`FingerprintTest`), 2 (`IdempotencyKeyTest`), 2 (`IdempotencyStoreTest`), 1 (`RetryStormTest`), 6 (`PaymentStandInTest`) and 3 (`DatabaseTest`). They add up to 70.
+   Each of the 19 files has a `tests="..."` count after a full run: 8 (`ConfirmPaymentTest`), 9 (`HoldRetryTest`), 2 (`RetryHoldScriptTest`), 3 (`CursorsTest`), 3 (`PaginationConsistencyTest`), 8 (`ApiSettingsTest`), 7 (`BreakingChangeTest`), 11 (`ContractConformanceTest`), 5 (`OpenApiDocumentTest`), 2 (`ApiServerTest`), 1 (`ReplyTest`), 5 (`Version0CompatibilityTest`), 3 (`FingerprintTest`), 2 (`IdempotencyKeyTest`), 3 (`IdempotencyStoreTest`), 5 (`JsonCodecTest`), 1 (`RetryStormTest`), 6 (`PaymentStandInTest`) and 5 (`DatabaseTest`). They add up to 89.
 
 ## Mistakes people make
 
@@ -215,7 +215,7 @@ grep -o 'tests="[0-9]*"' build/test-results/test/*.xml
 2. *Why does JUnit create a new instance of the class for every test?* So no test can see state left by another. It is why each test here gets a new `TestApi` and a new database.
 3. *What does `@TempDir` do?* JUnit makes a new empty folder for the test, passes it as the parameter, and deletes it afterwards.
 4. *When does an `@AfterEach` method run?* After every test method, also after a failed one.
-5. *How do 70 `@Test` methods give 70 results?* Each method runs once; this repository has no parameterized tests.
+5. *How do 89 `@Test` methods give 89 results?* Each method runs once; this repository has no parameterized tests.
 
 ## Further reading
 

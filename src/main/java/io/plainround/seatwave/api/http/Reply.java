@@ -1,5 +1,6 @@
 package io.plainround.seatwave.api.http;
 
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -10,7 +11,8 @@ import java.util.Objects;
  * @param status the HTTP status code
  * @param contentType the media type of the body, or an empty string when there is no body
  * @param body the body text, sent as UTF-8
- * @param headers further headers, in the order they are sent
+ * @param headers further headers, kept in the order they were added (the JDK server chooses the
+ *     order on the wire)
  */
 public record Reply(int status, String contentType, String body, Map<String, String> headers) {
 
@@ -18,11 +20,12 @@ public record Reply(int status, String contentType, String body, Map<String, Str
   static final String PROBLEM_JSON = "application/problem+json";
   private static final int NO_CONTENT = 204;
 
-  /** Copies the headers and checks the fields. */
+  /** Copies the headers, keeping their order, and checks the fields. */
   public Reply {
     Objects.requireNonNull(contentType, "contentType");
     Objects.requireNonNull(body, "body");
-    headers = Map.copyOf(headers);
+    // Map.copyOf would lose the order; an unmodifiable copy of an ordered map keeps it.
+    headers = Collections.unmodifiableMap(new LinkedHashMap<>(headers));
   }
 
   static Reply json(int status, String body) {

@@ -22,12 +22,16 @@ import java.util.Objects;
  */
 public final class Database implements AutoCloseable {
 
-  // Applied in this order, each once. A new migration is appended, never edited after release.
+  // Applied in this order. A new migration is appended, never changed in what it creates after
+  // release. H2 commits each DDL statement at once, so a script and its schema_history row are
+  // separate commits: every statement is written to be safe to run again (IF NOT EXISTS), and a
+  // crash between the two makes the next start run the script again harmlessly, then record it.
   private static final List<String> MIGRATIONS =
       List.of(
           "V1__module_1_schema.sql",
           "V2__idempotency_and_payment.sql",
-          "V3__seat_order_for_cursors.sql");
+          "V3__seat_order_for_cursors.sql",
+          "V4__seats_by_hold.sql");
 
   private final String url;
   // An in-memory H2 database lives while one connection to it is open; this one keeps it alive.

@@ -405,6 +405,7 @@ import java.io.Reader;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
@@ -458,19 +459,36 @@ The constructor stores the loaded properties and refuses `null`.
    *
    * @param path the file
    * @return the loaded properties
-   * @throws IOException if the file cannot be read
+   * @throws IOException if the file does not exist or cannot be read; the message says which
    */
   public static Properties load(Path path) throws IOException {
     Objects.requireNonNull(path, "path");
     Properties properties = new Properties();
     try (Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
       properties.load(reader);
+    } catch (NoSuchFileException missing) {
+      // The JDK's message is the bare path, which does not tell a reader what is wrong with it.
+      throw new IOException("the settings file " + path + " does not exist", missing);
+    } catch (IOException unreadable) {
+      throw new IOException(
+          "the settings file " + path + " cannot be read: " + unreadable.getMessage(), unreadable);
     }
     return properties;
   }
+
+  /**
+   * Records a problem that involves more than one key, so it is reported with the others.
+   *
+   * @param problem the problem line, naming the keys
+   */
+  public void reject(String problem) {
+    problems.add(Objects.requireNonNull(problem, "problem"));
+  }
 ```
 
-`load` is `static`, so you call it without a reader. `Files.newBufferedReader(path, StandardCharsets.UTF_8)` opens the file as UTF-8 text; the `try (...)` closes it afterwards. `properties.load(reader)` parses the `key=value` lines.
+`load` is `static`, so you call it without a reader. `Files.newBufferedReader(path, StandardCharsets.UTF_8)` opens the file as UTF-8 text; the `try (...)` closes it afterwards. `properties.load(reader)` parses the `key=value` lines. The two `catch` blocks give the failure words a person can act on. A missing file makes the JDK throw `NoSuchFileException`, whose message is only the path; the comment says so. It is rethrown as an `IOException` that says "the settings file ... does not exist". Any other read failure (a folder in place of a file, no permission) is rethrown as "the settings file ... cannot be read:" followed by the JDK's reason, such as `Is a directory`. Both keep the original exception as the cause. Every command-line program loads its settings through this method, so all of them print the clearer message.
+
+`reject` adds a problem line that no single key can produce: a rule between two keys. `ApiSettings.from` uses it, so such a rule is reported in the same list as every missing or invalid key.
 
 ```java
   /**
@@ -749,42 +767,52 @@ The line `public ApiSettings {` with no parentheses is a **compact constructor**
                 // A missing or invalid URL is already a problem line; this stand-in only lets the
                 // reading go on, so every other problem is reported in the same run.
                 .transform(text -> text.isEmpty() ? "http://127.0.0.1:1" : text));
+    int problemsBeforeTimes = reader.problems().size();
     Duration connect = reader.millisBetween("payment.connectTimeoutMillis", 1, MAX_TIMEOUT_MILLIS);
     Duration request = reader.millisBetween("payment.requestTimeoutMillis", 1, MAX_TIMEOUT_MILLIS);
     Duration lease = reader.millisBetween("payment.leaseMillis", 1, MAX_TIMEOUT_MILLIS);
+    // A rule between keys is checked only when each key was valid alone, so a stand-in value
+    // never produces a second, misleading problem line.
+    if (reader.problems().size() == problemsBeforeTimes
+        && !Payment.isLeaseLongEnough(connect, request, lease)) {
+      reader.reject(Payment.LEASE_TOO_SHORT);
+    }
     BigDecimal price = reader.amount("booking.seatPrice");
     String currency = reader.matching("booking.currency", CURRENCY, "three capital letters");
     int retryAfterSeconds = reader.intBetween("http.retryAfterSeconds", 1, MAX_RETRY_AFTER_SECONDS);
+    int problemsBeforeDates = reader.problems().size();
     Instant deprecatedAt = reader.instant("version0.deprecatedAt");
     Instant sunsetAt = reader.instant("version0.sunsetAt");
 ```
 
 The provider address is read with `LOOPBACK_URL`. If the key is missing or invalid, `matching` returns an empty string, and `URI.create("")` would be a legal but useless address. The `.transform(text -> text.isEmpty() ? "http://127.0.0.1:1" : text)` call replaces an empty string with a valid stand-in. `String.transform` applies a function to the string and returns the result; `cond ? a : b` is the conditional operator. The comment says it: the problem line is already recorded, and this only lets the reading go on, so every other problem is reported in the same run. The next lines read the three durations, the price (with `amount`), the currency, the retry delay in seconds, and the two dates of the old paths.
 
+After the three durations comes the first rule between keys. `problemsBeforeTimes` is the number of problems before the three were read; if it has not grown, each duration was valid alone, and `Payment.isLeaseLongEnough(...)` can be asked. If the lease is too short, `reader.reject(Payment.LEASE_TOO_SHORT)` adds the line to the same list. The comment says why the count is compared: a missing duration comes back as the minimum, a stand-in, and judging the lease against a stand-in would add a second, misleading line. `problemsBeforeDates` plays the same part for the two dates, checked just below.
+
 ```java
+    if (reader.problems().size() == problemsBeforeDates
+        && !Version0.isSunsetAfterDeprecation(deprecatedAt, sunsetAt)) {
+      reader.reject(Version0.SUNSET_TOO_EARLY);
+    }
     if (!reader.problems().isEmpty()) {
       return Result.error(reader.problems());
     }
-    try {
-      return Result.success(
-          new ApiSettings(
-              port,
-              inFlight,
-              url,
-              seed,
-              new Payment(paymentUrl, connect, request, lease),
-              price,
-              currency,
-              Duration.ofSeconds(retryAfterSeconds),
-              new Version0(deprecatedAt, sunsetAt)));
-    } catch (IllegalArgumentException crossFieldProblem) {
-      // Each key was valid alone; a rule between two keys failed (for example the lease).
-      return Result.error(List.of(crossFieldProblem.getMessage()));
-    }
+    // Every rule the constructors check was checked above, so these cannot throw.
+    return Result.success(
+        new ApiSettings(
+            port,
+            inFlight,
+            url,
+            seed,
+            new Payment(paymentUrl, connect, request, lease),
+            price,
+            currency,
+            Duration.ofSeconds(retryAfterSeconds),
+            new Version0(deprecatedAt, sunsetAt)));
   }
 ```
 
-If the reader has collected any problem, `Result.error(reader.problems())` returns them all; nothing is built. Otherwise the `ApiSettings` is built inside a `try`. Each key was valid alone, but the constructors also check rules between fields (for example, the lease against the two timeouts). Those throw `IllegalArgumentException`, which is caught and turned into a single-line error result.
+The second rule between keys: when both dates were valid alone, the sunset must come after the deprecation, or `Version0.SUNSET_TOO_EARLY` joins the list. Then, if the reader has collected any problem, `Result.error(reader.problems())` returns them all, the two rules between keys included; nothing is built. Otherwise the `ApiSettings` is built. The comment says why no `try` is needed: every rule the constructors check has already been checked, so they cannot throw here.
 
 ```java
   /**
@@ -826,7 +854,10 @@ The nested record `Seed`: how many events, how many sections (the first event ha
   public record Payment(
       URI baseUrl, Duration connectTimeout, Duration requestTimeout, Duration lease) {
 
-    /** Checks the fields. */
+    static final String LEASE_TOO_SHORT =
+        "payment.leaseMillis must be longer than the connect and request timeouts together";
+
+    /** Checks the fields; the lease rule stays here as the last line of defence. */
     public Payment {
       Objects.requireNonNull(baseUrl, "baseUrl");
       if (!LOOPBACK_URL.matcher(baseUrl.toString()).matches()) {
@@ -835,17 +866,21 @@ The nested record `Seed`: how many events, how many sections (the first event ha
       Objects.requireNonNull(connectTimeout, "connectTimeout");
       Objects.requireNonNull(requestTimeout, "requestTimeout");
       Objects.requireNonNull(lease, "lease");
+      if (!isLeaseLongEnough(connectTimeout, requestTimeout, lease)) {
+        throw new IllegalArgumentException(LEASE_TOO_SHORT);
+      }
+    }
+
+    static boolean isLeaseLongEnough(
+        Duration connectTimeout, Duration requestTimeout, Duration lease) {
       // A lease shorter than the call would let a second confirm take the seat over while the
       // first is still waiting for the provider.
-      if (lease.compareTo(connectTimeout.plus(requestTimeout)) <= 0) {
-        throw new IllegalArgumentException(
-            "payment.leaseMillis must be longer than the connect and request timeouts together");
-      }
+      return lease.compareTo(connectTimeout.plus(requestTimeout)) > 0;
     }
   }
 ```
 
-The nested record `Payment`. `baseUrl` must again match `LOOPBACK_URL`, checked a second time here so that a `Payment` built in code (not from a file) is held to the same rule. The last rule is the important one: `lease.compareTo(connectTimeout.plus(requestTimeout)) <= 0` means the lease must be longer than the two timeouts together. The comment says why: a lease shorter than the call would let a second confirm take the seat over while the first still waits for the provider.
+The nested record `Payment`. `baseUrl` must again match `LOOPBACK_URL`, checked a second time here so that a `Payment` built in code (not from a file) is held to the same rule. The last rule is the important one: the lease must be longer than the two timeouts together. It lives in the small method `isLeaseLongEnough`, where `lease.compareTo(connectTimeout.plus(requestTimeout)) > 0` is the test, so `from` and the constructor ask the same question; the message is the constant `LEASE_TOO_SHORT`. The comment says why the rule exists: a lease shorter than the call would let a second confirm take the seat over while the first still waits for the provider. The constructor keeps the check, as its Javadoc says, as the last line of defence: a `Payment` built in code, not from a file, must obey it too.
 
 ```java
   /**
@@ -856,18 +891,24 @@ The nested record `Payment`. `baseUrl` must again match `LOOPBACK_URL`, checked 
    */
   public record Version0(Instant deprecatedAt, Instant sunsetAt) {
 
-    /** Checks the fields. */
+    static final String SUNSET_TOO_EARLY = "version0.sunsetAt must be after version0.deprecatedAt";
+
+    /** Checks the fields; the date rule stays here as the last line of defence. */
     public Version0 {
       Objects.requireNonNull(deprecatedAt, "deprecatedAt");
       Objects.requireNonNull(sunsetAt, "sunsetAt");
-      if (!sunsetAt.isAfter(deprecatedAt)) {
-        throw new IllegalArgumentException("version0.sunsetAt must be after version0.deprecatedAt");
+      if (!isSunsetAfterDeprecation(deprecatedAt, sunsetAt)) {
+        throw new IllegalArgumentException(SUNSET_TOO_EARLY);
       }
+    }
+
+    static boolean isSunsetAfterDeprecation(Instant deprecatedAt, Instant sunsetAt) {
+      return sunsetAt.isAfter(deprecatedAt);
     }
   }
 ```
 
-The nested record `Version0`: the two dates for the old paths. `sunsetAt.isAfter(deprecatedAt)` must hold; a path cannot stop answering before it is announced as deprecated.
+The nested record `Version0`: the two dates for the old paths. `isSunsetAfterDeprecation` asks whether `sunsetAt.isAfter(deprecatedAt)`; a path cannot stop answering before it is announced as deprecated. As in `Payment`, the constructor and `from` share the method and the message `SUNSET_TOO_EARLY`.
 
 ## Try it yourself
 
@@ -890,10 +931,10 @@ usage: serve <serve.properties>
 
    Command: `./gradlew -q serve`
 
-3. Point it at a file that does not exist. The message is only the path:
+3. Point it at a file that does not exist. The message says what is wrong:
 
 ```text
-serving failed: /nonexistent.properties
+serving failed: the settings file /nonexistent.properties does not exist
 ```
 
    Command: `./gradlew -q serve --args="/nonexistent.properties"`
@@ -909,13 +950,14 @@ invalid: payment.url must be http://127.0.0.1:<port>, but was http://example.org
 
    Command: `./gradlew -q serve --args="/path/to/your/bad.properties"`
 
-5. Break only the cross-field rule: keep every key valid but set `payment.leaseMillis=100`. The one-line result:
+5. Break only the rules between keys: keep every key valid alone but set `payment.leaseMillis=100` and `version0.sunsetAt=2026-01-01T00:00:00Z`. Both appear in one run:
 
 ```text
 invalid: payment.leaseMillis must be longer than the connect and request timeouts together
+invalid: version0.sunsetAt must be after version0.deprecatedAt
 ```
 
-   This rule shows only when every single key is valid, because the settings record is built only then.
+   A rule between keys is checked only when the keys it compares are valid alone, so a missing lease gives only "payment.leaseMillis is missing".
 
 ## Mistakes people make
 
@@ -924,7 +966,7 @@ invalid: payment.leaseMillis must be longer than the connect and request timeout
 - **A silent default.** A missing key that quietly falls back to a number hides a forgotten choice. Here a missing key is a problem line.
 - **Letting a scheduled job throw.** A scheduler cancels a job that throws. `purgeExpiredKeys` catches the failure and logs it.
 - **Closing in the wrong order.** Closing the database before the server would let a request arrive with no database. `close()` stops the server before the database.
-- **A lease shorter than the call.** Two confirms could then pay for one seat. `Payment` refuses the combination at construction.
+- **A lease shorter than the call.** Two confirms could then pay for one seat. `ApiSettings.from` reports the combination with the other problems, and `Payment` refuses it at construction as well.
 
 ## Check yourself
 

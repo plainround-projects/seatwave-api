@@ -11,7 +11,7 @@ These are the tests that attack the heart of the lesson: a client times out and 
 | `booking/FailingKeyWrite.java` | A helper: a database trigger that makes the key write fail, to simulate a crash. |
 | `idempotency/FingerprintTest.java` | The fingerprint of a request: same request same value, different request different value. |
 | `idempotency/IdempotencyKeyTest.java` | Reading the `Idempotency-Key` header: only the quoted string the contract defines. |
-| `idempotency/IdempotencyStoreTest.java` | The key table directly: purge in batches, complete once, replay. |
+| `idempotency/IdempotencyStoreTest.java` | The key table directly: purge in batches, complete once, replay, and two requests with one expired key. |
 
 ## Why this repository uses it
 
@@ -729,13 +729,20 @@ class IdempotencyKeyTest {
 package io.plainround.seatwave.api.idempotency;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 import io.plainround.seatwave.api.ContractLimits;
 import io.plainround.seatwave.api.HttpStatus;
 import io.plainround.seatwave.api.TestApi;
 import io.plainround.seatwave.api.store.Database;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 class IdempotencyStoreTest {
@@ -743,11 +750,15 @@ class IdempotencyStoreTest {
   private static final Instant NOW = TestApi.START;
   private static final int OLD_KEYS = 3;
   private static final int BATCH = 2;
+  // Generous for a wait that takes milliseconds, so only a request that never blocks or never
+  // finishes fails the test.
+  private static final Duration LOCK_WAIT_LIMIT = Duration.ofSeconds(5);
   private final IdempotencyStore store = new IdempotencyStore();
 
 ```
 
-- `NOW` is the test clock's start. `OLD_KEYS = 3` and `BATCH = 2` shape the purge test.
+- The imports add `await` (Awaitility), the JDBC types `PreparedStatement`, `ResultSet` and `SQLException`, `Duration`, and `CompletableFuture` with `TimeUnit` for the test that runs two requests on two threads.
+- `NOW` is the test clock's start. `OLD_KEYS = 3` and `BATCH = 2` shape the purge test. `LOCK_WAIT_LIMIT` (5 seconds) bounds every wait of the two-request test.
 - `store` is the real `IdempotencyStore`; it has no state, so one instance is enough.
 
 #### Purge: only expired keys, and at most a batch
@@ -804,6 +815,82 @@ class IdempotencyStoreTest {
           .isEqualTo(new ClaimResult.BodyMismatch());
     }
   }
+```
+
+- `claim("k")` creates a claim: endpoint `POST /v1/holds`, the key, and a fingerprint made from the endpoint and the key text (the helper is at the end of the class). `store.claim(connection, claim, NOW)` inserts it in state `IN_PROGRESS`.
+- `new StoredReply(HttpStatus.CREATED, "/v1/holds/x", "{}")` is the reply to store: status, location and body.
+- `store.complete(connection, claim, reply)` returns **true** the first time. The second call returns **false**: the update has the condition `state = 'IN_PROGRESS'`, so only the first completion wins.
+- After `commit()`, a second `claim` of the same key and fingerprint returns `new ClaimResult.Replay(reply)`: the stored reply comes back. `isEqualTo` works because `ClaimResult.Replay` and `StoredReply` are records.
+- A claim of the same key with a different fingerprint (`Fingerprint.of("x", "y")`) returns `new ClaimResult.BodyMismatch()`: the key is being reused for another request.
+
+#### Two requests with one expired key, forced to interleave
+
+```java
+  @Test
+  void letsOneOfTwoRequestsWithOneExpiredKeyWorkAndReplaysItsReplyToTheOther() throws Exception {
+    // The first connection is declared last so it closes first: a failed assertion then ends its
+    // transaction and frees the second request instead of leaving it waiting on the row lock.
+    try (Database database = Database.open("jdbc:h2:mem:keys-" + System.nanoTime());
+        Connection watcher = database.connect();
+        Connection second = database.connect();
+        Connection first = database.connect()) {
+      KeyClaim claim = claim("expired");
+      first.setAutoCommit(false);
+      store.claim(first, claim, NOW);
+      store.complete(first, claim, new StoredReply(HttpStatus.CREATED, "/v1/holds/old", "{}"));
+      first.commit();
+      Instant later = NOW.plus(ContractLimits.KEY_RETENTION);
+      StoredReply newReply = new StoredReply(HttpStatus.CREATED, "/v1/holds/new", "{\"new\":1}");
+
+      // The first request takes the expired key over and keeps its transaction open.
+      assertThat(store.claim(first, claim, later)).isEqualTo(new ClaimResult.Claimed());
+      // The second reads the same expired row now, before the first commits: the interleaving
+      // that used to leave it with an IN_PROGRESS key and nothing to complete.
+      second.setAutoCommit(false);
+      CompletableFuture<ClaimResult> secondResult = new CompletableFuture<>();
+      Thread.ofPlatform()
+          .start(() -> {
+            try {
+              secondResult.complete(store.claim(second, claim, later));
+            } catch (SQLException failure) {
+              secondResult.completeExceptionally(failure);
+            }
+          });
+      // H2 spins rather than parks while it waits for a row lock, so the wait is read from H2.
+      await().atMost(LOCK_WAIT_LIMIT).until(() -> secondResult.isDone() || isBlocked(watcher));
+      store.complete(first, claim, newReply);
+      first.commit();
+
+      assertThat(secondResult.get(LOCK_WAIT_LIMIT.toSeconds(), TimeUnit.SECONDS))
+          .isEqualTo(new ClaimResult.Replay(newReply));
+      second.rollback();
+      assertThat(store.count(first)).isEqualTo(1);
+    }
+  }
+```
+
+This test plays two requests that present the same expired key at the same moment, in a fixed order, with no luck involved.
+
+- Three connections stand for three actors: `first` and `second` are the two requests, `watcher` only looks. The comment explains the order of the declarations: try-with-resources closes the last one first, so if an assertion fails, `first` ends its transaction and lets `second` go, instead of leaving it waiting forever.
+- The setup claims the key at `NOW`, completes it with an old reply and commits. At `later = NOW + KEY_RETENTION` that key has expired.
+- `store.claim(first, claim, later)` is the first request. It finds the expired row, takes it over and gets `Claimed`. Its transaction stays open, so it holds the row's lock.
+- The second request runs on its own thread: `Thread.ofPlatform().start(...)` starts an ordinary operating-system thread. Its result goes into a `CompletableFuture`, a box that a thread fills once (`complete`, or `completeExceptionally` for a failure) and another thread reads with `get`. The second request reads the same expired row (the first has not committed) and then waits for the row lock.
+- `await().atMost(LOCK_WAIT_LIMIT).until(...)` is Awaitility: it checks the condition again and again for up to 5 seconds. The comment says why it does not look at the thread's state: while H2 waits for a row lock, the thread keeps running and checking, so the JDK reports it as `RUNNABLE`. The test asks H2 instead (`isBlocked`, below). The condition is also true if the second request has already finished, so a version of the code that does not wait at all reaches the assertion and fails there, not in the wait.
+- Only then does the first request complete its key with `newReply` and commit. That is the interleaving that once left the second request with `Resumed` and nothing to complete.
+- `secondResult.get(5, SECONDS)` waits for the second request's answer. It must be `Replay(newReply)`: the second request does not act, it gets the first one's reply. `store.count(first)` is 1: still one key row. `LOCK_WAIT_LIMIT` is far longer than the milliseconds this takes, as its comment says, so only a request that never blocks or never finishes fails the test.
+
+#### The helpers
+
+```java
+  private static boolean isBlocked(Connection watcher) throws SQLException {
+    try (PreparedStatement query =
+            watcher.prepareStatement(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.SESSIONS WHERE BLOCKER_ID IS NOT NULL");
+        ResultSet rows = query.executeQuery()) {
+      rows.next();
+      return rows.getLong(1) > 0;
+    }
+  }
 
   private static KeyClaim claim(String key) {
     return new KeyClaim(
@@ -812,11 +899,8 @@ class IdempotencyStoreTest {
 }
 ```
 
-- `claim("k")` creates a claim: endpoint `POST /v1/holds`, the key, and a fingerprint made from the endpoint and the key text. `store.claim(connection, claim, NOW)` inserts it in state `IN_PROGRESS`.
-- `new StoredReply(HttpStatus.CREATED, "/v1/holds/x", "{}")` is the reply to store: status, location and body.
-- `store.complete(connection, claim, reply)` returns **true** the first time. The second call returns **false**: the update has the condition `state = 'IN_PROGRESS'`, so only the first completion wins.
-- After `commit()`, a second `claim` of the same key and fingerprint returns `new ClaimResult.Replay(reply)`: the stored reply comes back. `isEqualTo` works because `ClaimResult.Replay` and `StoredReply` are records.
-- A claim of the same key with a different fingerprint (`Fingerprint.of("x", "y")`) returns `new ClaimResult.BodyMismatch()`: the key is being reused for another request.
+- `isBlocked` asks H2 whether any session is waiting for another. `INFORMATION_SCHEMA.SESSIONS` is a view H2 keeps with one row per open connection; `BLOCKER_ID` is the id of the session it waits for, or `NULL`. A count above zero means someone is blocked.
+- `claim(key)` builds the claim every test uses: the endpoint `POST /v1/holds`, the key, and a fingerprint made from the endpoint and the key text.
 
 ## Try it yourself
 
@@ -828,7 +912,7 @@ All ran in a scratch copy on 11 November 2026. Timings differ on every run.
 ./gradlew --offline cleanTest test --tests '*booking*' --tests '*idempotency*'
 ```
 
-   Output: 24 `PASSED` lines: `HoldRetryTest` 9, `ConfirmPaymentTest` 8, `FingerprintTest` 3, `IdempotencyKeyTest` 2 and `IdempotencyStoreTest` 2.
+   Output: 25 `PASSED` lines: `HoldRetryTest` 9, `ConfirmPaymentTest` 8, `FingerprintTest` 3, `IdempotencyKeyTest` 2 and `IdempotencyStoreTest` 3.
 
 2. Run one attack alone:
 

@@ -1,4 +1,4 @@
-# Lab 1: a first draft of the POST /v1/holds entry with three mistakes for lintContract to find.
+# Lab 1: a first draft of the POST /v1/holds entry with four mistakes for lintContract to find.
 openapi: 3.1.2
 info:
   title: SeatWave holds (Lab 1, first draft)

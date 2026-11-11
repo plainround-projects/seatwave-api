@@ -5,10 +5,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.github.sviperll.result4j.Result;
 import io.plainround.seatwave.api.TestApi;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Properties;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class ApiSettingsTest {
 
@@ -63,6 +65,44 @@ class ApiSettingsTest {
 
     assertThat(ApiSettings.from(new SettingsReader(properties)).toString())
         .contains("payment.leaseMillis must be longer than the connect and request timeouts");
+  }
+
+  @Test
+  void reportsBothRulesBetweenKeysWithTheOtherProblemsInOneRun() throws Exception {
+    Properties properties = SettingsReader.load(Path.of("config/serve.properties"));
+    properties.setProperty("payment.leaseMillis", "1000");
+    properties.setProperty("version0.sunsetAt", properties.getProperty("version0.deprecatedAt"));
+    properties.setProperty("http.port", "80");
+
+    assertThat(ApiSettings.from(new SettingsReader(properties)).toString())
+        .contains("http.port must be from 1024 to 65535")
+        .contains("payment.leaseMillis must be longer than the connect and request timeouts")
+        .contains("version0.sunsetAt must be after version0.deprecatedAt");
+  }
+
+  @Test
+  void checksARuleBetweenKeysOnlyWhenEachKeyIsValidAlone() throws Exception {
+    Properties properties = SettingsReader.load(Path.of("config/serve.properties"));
+    properties.remove("payment.leaseMillis");
+    properties.remove("version0.sunsetAt");
+
+    assertThat(ApiSettings.from(new SettingsReader(properties)).toString())
+        .contains("payment.leaseMillis is missing")
+        .contains("version0.sunsetAt is missing")
+        .doesNotContain("must be longer than")
+        .doesNotContain("must be after");
+  }
+
+  @Test
+  void saysWhatIsWrongWithASettingsFileThatCannotBeLoaded(@TempDir Path folder) {
+    Path missing = folder.resolve("serve.properties");
+
+    assertThatThrownBy(() -> SettingsReader.load(missing))
+        .isInstanceOf(IOException.class)
+        .hasMessage("the settings file " + missing + " does not exist");
+    assertThatThrownBy(() -> SettingsReader.load(folder))
+        .isInstanceOf(IOException.class)
+        .hasMessageStartingWith("the settings file " + folder + " cannot be read: ");
   }
 
   @Test

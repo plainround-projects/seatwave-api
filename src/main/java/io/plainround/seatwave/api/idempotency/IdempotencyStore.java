@@ -55,23 +55,14 @@ public final class IdempotencyStore {
               : new ClaimResult.Resumed();
         }
         if (row.getLong("expires_at") <= now.toEpochMilli()) {
-          // An expired key is forgotten: this request is new, whatever the old one did.
-          forget(connection, claim);
-          return tryInsert(connection, claim, now)
+          // An expired key is forgotten: this request is new, whatever the old one did. The take
+          // over is one conditional UPDATE, so of two requests with the same expired key exactly
+          // one wins; the other waits for its row lock and then finds the key alive again.
+          return takeOverExpired(connection, claim, now)
               ? new ClaimResult.Claimed()
-              : new ClaimResult.Resumed();
+              : resultOfLiveKey(connection, claim);
         }
-        if (!row.getString("fingerprint").equals(claim.fingerprint().hex())) {
-          return new ClaimResult.BodyMismatch();
-        }
-        if (COMPLETED.equals(row.getString("state"))) {
-          return new ClaimResult.Replay(
-              new StoredReply(
-                  row.getInt("response_status"),
-                  row.getString("response_location"),
-                  row.getString("response_body")));
-        }
-        return new ClaimResult.Resumed();
+        return resultOf(row, claim);
       }
     }
   }
@@ -167,13 +158,54 @@ public final class IdempotencyStore {
     }
   }
 
-  private static void forget(Connection connection, KeyClaim claim) throws SQLException {
-    try (PreparedStatement delete =
+  private static boolean takeOverExpired(Connection connection, KeyClaim claim, Instant now)
+      throws SQLException {
+    try (PreparedStatement update =
         connection.prepareStatement(
-            "DELETE FROM idempotency_keys WHERE endpoint = ? AND idempotency_key = ?")) {
-      delete.setString(1, claim.endpoint());
-      delete.setString(2, claim.key().value());
-      delete.executeUpdate();
+            "UPDATE idempotency_keys SET fingerprint = ?, state = ?, response_status = NULL,"
+                + " response_location = NULL, response_body = NULL, created_at = ?, expires_at = ?"
+                + " WHERE endpoint = ? AND idempotency_key = ? AND expires_at <= ?")) {
+      update.setString(1, claim.fingerprint().hex());
+      update.setString(2, IN_PROGRESS);
+      update.setLong(3, now.toEpochMilli());
+      update.setLong(4, now.plus(ContractLimits.KEY_RETENTION).toEpochMilli());
+      update.setString(5, claim.endpoint());
+      update.setString(6, claim.key().value());
+      // The expiry is checked again here, under the row lock, not only in the read before it.
+      update.setLong(7, now.toEpochMilli());
+      return update.executeUpdate() == 1;
     }
+  }
+
+  private static ClaimResult resultOfLiveKey(Connection connection, KeyClaim claim)
+      throws SQLException {
+    try (PreparedStatement query =
+        connection.prepareStatement(
+            "SELECT fingerprint, state, response_status, response_location, response_body"
+                + " FROM idempotency_keys WHERE endpoint = ? AND idempotency_key = ?")) {
+      query.setString(1, claim.endpoint());
+      query.setString(2, claim.key().value());
+      try (ResultSet row = query.executeQuery()) {
+        // The winner of the take over committed its row; a purge cannot remove a live key.
+        if (!row.next()) {
+          throw new IllegalStateException("a key taken over by another request disappeared");
+        }
+        return resultOf(row, claim);
+      }
+    }
+  }
+
+  private static ClaimResult resultOf(ResultSet row, KeyClaim claim) throws SQLException {
+    if (!row.getString("fingerprint").equals(claim.fingerprint().hex())) {
+      return new ClaimResult.BodyMismatch();
+    }
+    if (COMPLETED.equals(row.getString("state"))) {
+      return new ClaimResult.Replay(
+          new StoredReply(
+              row.getInt("response_status"),
+              row.getString("response_location"),
+              row.getString("response_body")));
+    }
+    return new ClaimResult.Resumed();
   }
 }

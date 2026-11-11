@@ -51,7 +51,7 @@ After the two constraints, OSV listed no known vulnerability for any of the 87 j
 
 This checks formatting with Spotless, compiles with `-Xlint:all -Werror`, runs the tests and fails if line coverage drops below 0.80. Run `./gradlew spotlessApply` first to fix formatting. Every test starts its own API and stand-in provider on 127.0.0.1, on ports the system picks, with an in-memory database.
 
-Result on 11 November 2026 (Temurin 25.0.2, macOS): `BUILD SUCCESSFUL` in 9 seconds, 70 tests, 0 failures, line coverage 85.9 percent (1,935 of 2,252 lines). The untested lines are mostly the `main` methods of the command-line classes, which print and call `System.exit`.
+Result on 11 November 2026 (Temurin 25.0.2, macOS): `BUILD SUCCESSFUL` in 11 seconds, 89 tests, 0 failures, line coverage 86.2 percent (1,979 of 2,297 lines). The untested lines are mostly the `main` methods of the command-line classes, which print and call `System.exit`.
 
 ## The contract checks
 
@@ -79,6 +79,19 @@ verdict: BREAKING, released clients would fail
 ```
 
 The second command ends with exit status 3, which Gradle reports as a failed task; its footer is cut here. The same comparison against `seatwave-api-1.1.0-additive.yaml` says "compatible", and so does the current document against the released one, which `BreakingChangeTest` checks on every build.
+
+Both checks run because neither is complete alone: on this document openapi-diff missed the renamed response field (it shows the seats operation as "no changes"), and the house rules caught it.
+
+On Lab 1's first draft, `./gradlew -q lintContract --args='openapi/examples/holds-entry-broken.yaml'` finds its four mistakes in five lines, because the parser reports the missing `Hold` schema twice:
+
+```text
+openapi/examples/holds-entry-broken.yaml: 5 problem(s)
+  parser: attribute paths.'/v1/holds'(post).responses.201.content.'application/json'.schema.#/components/schemas/Hold is missing
+  parser: Could not find /components/schemas/Hold in contents of #/components/schemas/Hold
+  rule: POST /v1/holds 409 must be application/problem+json Problem
+  rule: POST /v1/holds creates something, so it must require Idempotency-Key
+  rule: POST /v1/holds request: required field customer is not defined
+```
 
 ## The server, the stand-in provider and a session
 
@@ -173,7 +186,7 @@ seatwave_idempotency_keys_stored 9
 audit line added to build/retry-hold/audit.log
 ```
 
-Without `--run` it only prints its plan; it refuses a port below 1024, a seat or a key that does not match the contract, and more than 20 requests.
+Without `--run` it only prints its plan and a curl command that can be pasted as it is. With `--run` but without `--yes` it asks on the terminal first; when there is no terminal to ask on, it says "nothing sent" and exits with status 1. It refuses a port below 1024, a seat or a key that does not match the contract, and more than 20 requests.
 
 ## The retry storm
 
@@ -234,16 +247,16 @@ The tool fills a fresh H2 file database under `build/key-size/` with keys that e
 
 ## The settings
 
-Every program reads one settings file in `config/`, and every key is required: there are no defaults in code. A missing or invalid key is reported with its name, all of them in one run. The numbers the contract publishes (500 items per page at most, 100 by default, a body of at most 1,024 bytes, a 300-second hold, 24 hours of key retention) are constants in `ContractLimits`, not settings, and a test checks that they match the document.
+Every program reads one settings file in `config/`, and every key is required: there are no defaults in code. A missing or invalid key is reported with its name, all of them in one run, together with the two rules between keys (the lease must be longer than the two payment timeouts together, and the sunset must come after the deprecation). The numbers the contract publishes (500 items per page at most, 100 by default, a body of at most 1,024 bytes, a 300-second hold, 24 hours of key retention) are constants in `ContractLimits`, not settings, and a test checks that they match the document.
 
 ## Project structure
 
 ```text
 openapi/       the contract (seatwave-api.yaml), the released 1.0.0 copy, and examples: an additive and a
-               breaking 1.1.0 candidate, and Lab 1's holds entry (a broken draft and the solution)
+               breaking 1.1.0 candidate, and Lab 1's holds entry (a broken draft with four mistakes, and the solution)
 config/        settings for serve, paymentStandIn, retryStorm and pageWalk (keyStoreSize takes a count)
 scripts/       retry-hold.sh: one hold sent several times with one key, with a dry run and an audit line
-src/main/resources/db/migration/   V1 (Module 1's tables), V2 (keys, payment), V3 (seat order for cursors)
+src/main/resources/db/migration/   V1 (Module 1's tables), V2 (keys, payment), V3 (seat order for cursors), V4 (the hold_id index)
 src/main/java/io/plainround/seatwave/api/
   ContractLimits, SeatWaveApi, ServeCli
   config/      SettingsReader, ApiSettings

@@ -78,7 +78,10 @@ class OpenApiDocumentTest {
     assertThat(ContractRules.check(broken))
         .anySatisfy(problem -> assertThat(problem).contains("Idempotency-Key"))
         .anySatisfy(problem -> assertThat(problem).contains("409 must be application/problem+json"))
-        .anySatisfy(problem -> assertThat(problem).startsWith("parser:"));
+        .anySatisfy(problem -> assertThat(problem).startsWith("parser:"))
+        .anySatisfy(problem ->
+            assertThat(problem)
+                .isEqualTo("rule: POST /v1/holds request: required field customer is not defined"));
   }
 
   @Test

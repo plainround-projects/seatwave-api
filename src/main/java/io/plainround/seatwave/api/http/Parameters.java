@@ -25,10 +25,21 @@ final class Parameters {
   }
 
   static Result<Parameters, List<FieldError>> parse(String encoded, Set<String> allowedNames) {
-    Map<String, String> values = new LinkedHashMap<>();
     List<FieldError> errors = new ArrayList<>();
+    Parameters parameters = read(encoded, allowedNames, errors);
+    return errors.isEmpty() ? Result.success(parameters) : Result.error(List.copyOf(errors));
+  }
+
+  /**
+   * Reads every pair, adds one error per bad pair to {@code errors}, and keeps the good ones, so
+   * the caller can still check their values and report every problem in one reply.
+   *
+   * @return the allowed names with their first value
+   */
+  static Parameters read(String encoded, Set<String> allowedNames, List<FieldError> errors) {
+    Map<String, String> values = new LinkedHashMap<>();
     if (encoded.isEmpty()) {
-      return Result.success(new Parameters(values));
+      return new Parameters(values);
     }
     for (String pair : encoded.split("&", -1)) {
       int separator = pair.indexOf('=');
@@ -49,7 +60,7 @@ final class Parameters {
         errors.add(new FieldError(pair, "is not valid percent-encoding"));
       }
     }
-    return errors.isEmpty() ? Result.success(new Parameters(values)) : Result.error(errors);
+    return new Parameters(values);
   }
 
   Optional<String> get(String name) {

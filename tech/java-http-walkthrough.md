@@ -80,26 +80,35 @@ The reply has the media type `application/problem+json` and a body with `type`, 
 package io.plainround.seatwave.api.json;
 
 import com.fasterxml.jackson.core.JacksonException;
+import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.core.StreamReadFeature;
+import com.fasterxml.jackson.core.exc.InputCoercionException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.MapperFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.cfg.CoercionAction;
+import com.fasterxml.jackson.databind.cfg.CoercionInputShape;
 import com.fasterxml.jackson.databind.exc.MismatchedInputException;
 import com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException;
 import com.fasterxml.jackson.databind.json.JsonMapper;
+import com.fasterxml.jackson.databind.type.LogicalType;
 import com.github.sviperll.result4j.Result;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Objects;
 import java.util.stream.Collectors;
 ```
 
-Imports. `ObjectMapper` and `JsonMapper` are Jackson's main classes. `DeserializationFeature`, `MapperFeature` and `StreamReadFeature` are the switches this class sets. `UnrecognizedPropertyException` and `MismatchedInputException` are two kinds of failure Jackson reports. `Result` is result4j's success-or-error type.
+Imports. `ObjectMapper` and `JsonMapper` are Jackson's main classes. `DeserializationFeature`, `MapperFeature` and `StreamReadFeature` are the switches this class sets; `LogicalType`, `CoercionInputShape` and `CoercionAction` are the words of a finer switch, the coercion configuration. `JsonParser` and `JsonToken` read JSON one token at a time. `UnrecognizedPropertyException`, `MismatchedInputException`, `JsonMappingException` and `InputCoercionException` are kinds of failure Jackson reports. `IOException` and `UncheckedIOException` are the JDK's input and output errors. `Result` is result4j's success-or-error type.
 
 ```java
 /**
- * JSON in and out, bound only to known records. Unknown fields, nulls for numbers, trailing data
- * and duplicate fields are refused, so a body either matches a record exactly or is rejected with a
- * reason that names the field.
+ * JSON in and out, bound only to known records. Unknown fields, nulls for numbers, a value of the
+ * wrong type, a number out of range, trailing data and duplicate fields are refused, so a body
+ * either matches a record exactly or is rejected with a reason that names the field.
  *
  * <p>Thread-safe: the mapper is configured once in the constructor and only read afterwards, which
  * is the use Jackson documents as safe across threads.
@@ -107,7 +116,14 @@ Imports. `ObjectMapper` and `JsonMapper` are Jackson's main classes. `Deserializ
 public final class JsonCodec {
 ```
 
-The Javadoc states the rule: bound only to known records; unknown fields, nulls for numbers, trailing data and duplicate fields are refused; and a refusal names the field. "Thread-safe: the mapper is configured once in the constructor and only read afterwards" is the way Jackson documents its mapper as safe to share between threads.
+The Javadoc states the rule: bound only to known records; unknown fields, nulls for numbers, a value of the wrong type, a number out of range, trailing data and duplicate fields are refused; and a refusal names the field. "Thread-safe: the mapper is configured once in the constructor and only read afterwards" is the way Jackson documents its mapper as safe to share between threads.
+
+```java
+  // RFC 6901: the empty pointer is the whole document.
+  private static final String WHOLE_BODY = "";
+```
+
+`WHOLE_BODY` is the JSON pointer of the whole body. RFC 6901, the standard for JSON pointers, says the empty text `""` points at the whole document, and `/` points at a field whose name is empty. The constant gives the empty text a name, so a reader sees what it means.
 
 ```java
   private final ObjectMapper mapper =
@@ -119,7 +135,14 @@ The Javadoc states the rule: bound only to known records; unknown fields, nulls 
           // "1" and 1.5 are not the integer the contract asks for: no silent conversion.
           .disable(MapperFeature.ALLOW_COERCION_OF_SCALARS)
           .disable(DeserializationFeature.ACCEPT_FLOAT_AS_INT)
-          .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+          // The switch above covers numbers and booleans only; 5 or true is not a string either.
+          .withCoercionConfig(
+              LogicalType.Textual,
+              textual ->
+                  textual
+                      .setCoercion(CoercionInputShape.Integer, CoercionAction.Fail)
+                      .setCoercion(CoercionInputShape.Float, CoercionAction.Fail)
+                      .setCoercion(CoercionInputShape.Boolean, CoercionAction.Fail))
           .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
           .build();
 ```
@@ -130,7 +153,7 @@ The mapper is built once. `JsonMapper.builder()` starts a builder and `.build()`
 - `FAIL_ON_NULL_FOR_PRIMITIVES` on: a JSON `null` for a Java `int` or `long` is an error and not a quiet zero.
 - `ALLOW_COERCION_OF_SCALARS` off: the text `"1"` is not accepted where a number is expected.
 - `ACCEPT_FLOAT_AS_INT` off: `1.5` is not accepted for a whole number, and is not rounded.
-- `FAIL_ON_TRAILING_TOKENS` on: anything after the first complete JSON value (for example `{...} {}`) is an error.
+- `withCoercionConfig(LogicalType.Textual, ...)`: the switch above covers number and boolean targets only. A *coercion* is a silent conversion of one type into another. `LogicalType.Textual` means "a target of type text", such as `String`; `CoercionInputShape.Integer`, `Float` and `Boolean` are the shapes of input `5`, `1.5` and `true`; `CoercionAction.Fail` refuses them. Without these three lines, `"customer":5` was accepted and stored as the text `"5"`.
 - `STRICT_DUPLICATE_DETECTION` on: the same field name twice in one object is an error. Without this, the last value wins and two parsers can disagree about one request.
 
 ```java
@@ -145,32 +168,57 @@ The mapper is built once. `JsonMapper.builder()` starts a builder and `.build()`
   public <T> Result<T, BindingProblem> read(String json, Class<T> type) {
     Objects.requireNonNull(json, "json");
     Objects.requireNonNull(type, "type");
-    try {
-      T value = mapper.readValue(json, type);
-      if (value == null) {
-        return Result.error(new BindingProblem("", "the body must be a JSON object"));
+    // The parser is driven by hand, so an empty body, a body that is not an object and data after
+    // the object each get their own message instead of one generic type error.
+    try (JsonParser parser = mapper.createParser(json)) {
+      JsonToken first = parser.nextToken();
+      if (first == null) {
+        return Result.error(
+            new BindingProblem(WHOLE_BODY, "the body is empty; send a JSON object"));
+      }
+      if (first != JsonToken.START_OBJECT) {
+        return Result.error(new BindingProblem(WHOLE_BODY, "the body must be a JSON object"));
+      }
+      T value = mapper.readValue(parser, type);
+      if (parser.nextToken() != null) {
+        return Result.error(
+            new BindingProblem(WHOLE_BODY, "the body has data after the JSON object"));
       }
       return Result.success(value);
     } catch (UnrecognizedPropertyException unknownField) {
       return Result.error(
           new BindingProblem(
-              "/" + unknownField.getPropertyName(), "is not a field of this request"));
+              "/" + escaped(unknownField.getPropertyName()), "is not a field of this request"));
     } catch (MismatchedInputException wrongType) {
       return Result.error(new BindingProblem(pointerOf(wrongType), "has the wrong type"));
+    } catch (JsonMappingException unbound) {
+      // 99999999999999999999 is valid JSON; it only does not fit the field's type.
+      if (unbound.getCause() instanceof InputCoercionException) {
+        return Result.error(
+            new BindingProblem(pointerOf(unbound), "is out of range for this field"));
+      }
+      return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
     } catch (JacksonException malformed) {
-      return Result.error(new BindingProblem("", "the body is not valid JSON"));
+      return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
+    } catch (IOException notReadable) {
+      // Every parse failure is a JacksonException; reading from a string has no other I/O to fail.
+      throw new UncheckedIOException("reading a string failed", notReadable);
     }
   }
 ```
 
-`read` binds a JSON text to a record type. `<T> Result<T, BindingProblem>` is a generic method: it returns the record or a problem. `mapper.readValue(json, type)` does the binding. The four outcomes:
+`read` binds a JSON text to a record type. `<T> Result<T, BindingProblem>` is a generic method: it returns the record or a problem. It drives a **parser** (a reader that hands out the JSON one token at a time: `{`, a field name, a value, `}`) by hand, so it can tell three problems with the whole body apart. `try (JsonParser parser = ...)` closes the parser at the end. The outcomes:
 
-- A `null` result (the body was the JSON text `null`) becomes "the body must be a JSON object" at the pointer `""`.
-- `UnrecognizedPropertyException` becomes the pointer `/` plus the field name, with "is not a field of this request".
-- `MismatchedInputException` (a wrong type, such as text for a number) becomes the pointer of the field and "has the wrong type".
+- `parser.nextToken()` returns `null` when there is no token at all: the body is empty. Pointer `""`, "the body is empty; send a JSON object".
+- A first token that is not `START_OBJECT` (the `{`) means the body is an array, a number, a string or `null`. Pointer `""`, "the body must be a JSON object".
+- `mapper.readValue(parser, type)` binds exactly one object. If `parser.nextToken()` then finds anything more, the body has trailing data (for example `{...} {}`). Pointer `""`, "the body has data after the JSON object".
+- `UnrecognizedPropertyException` becomes the pointer `/` plus the escaped field name, with "is not a field of this request".
+- `MismatchedInputException` (a wrong type, such as text for a number or a number for text) becomes the pointer of the field and "has the wrong type".
+- `JsonMappingException` whose cause is an `InputCoercionException` is a number that is valid JSON but does not fit the field, such as `99999999999999999999` for a `Long`. It becomes the field's pointer and "is out of range for this field". Any other mapping failure keeps the generic message.
 - Any other `JacksonException` (the text is not JSON at all, or a duplicate field) becomes the whole-body pointer `""` and "the body is not valid JSON".
+- An `IOException` that is not a `JacksonException` cannot happen when the input is a string; it would be a bug, so it is rethrown unchecked, with the original as its cause.
 
-The order of the `catch` blocks matters: the two specific kinds are subtypes of `JacksonException`, so they must come first. A **JSON pointer** (RFC 6901) is a path into a JSON document: `/eventId` means the field `eventId` of the top-level object.
+The order of the `catch` blocks matters: a `catch` takes every subtype of its exception, so the specific kinds (`UnrecognizedPropertyException` and `MismatchedInputException` are subtypes of `JsonMappingException`, which is a subtype of `JacksonException`, which is a subtype of `IOException`) must come first. A **JSON pointer** (RFC 6901) is a path into a JSON document: `/eventId` means the field `eventId` of the top-level object.
 
 ```java
   /**
@@ -192,16 +240,25 @@ The order of the `catch` blocks matters: the two specific kinds are subtypes of 
 `write` turns a record, a list or a map into JSON text. A failure to write means the programmer passed something Jackson cannot write, so it is a bug, and it is rethrown as an unchecked `IllegalArgumentException` with the original as its cause.
 
 ```java
-  private static String pointerOf(MismatchedInputException wrongType) {
+  private static String pointerOf(JsonMappingException failure) {
     // RFC 6901 pointer: "/field" for each step of the path Jackson was reading.
-    return wrongType.getPath().stream()
+    return failure.getPath().stream()
         .map(step ->
-            step.getFieldName() == null ? String.valueOf(step.getIndex()) : step.getFieldName())
+            step.getFieldName() == null
+                ? String.valueOf(step.getIndex())
+                : escaped(step.getFieldName()))
         .collect(Collectors.joining("/", "/", ""));
+  }
+
+  private static String escaped(String fieldName) {
+    // RFC 6901: "~" and "/" inside a name are written "~0" and "~1", in this order.
+    return fieldName.replace("~", "~0").replace("/", "~1");
   }
 ```
 
-`pointerOf` builds the pointer from the path Jackson was reading when it failed. `getPath()` is a list of steps; each step has a field name or, inside an array, an index. `.stream().map(...)` turns each step into text. `Collectors.joining("/", "/", "")` joins the steps with `/`, puts `/` at the start and nothing at the end. The comment names RFC 6901. One quirk: a failure with an empty path, such as trailing data or a JSON array in place of an object, gives the pointer `/` and not `""`.
+`pointerOf` builds the pointer from the path Jackson was reading when it failed. It takes a `JsonMappingException`, the parent of both the type error and the range error. `getPath()` is a list of steps; each step has a field name or, inside an array, an index. `.stream().map(...)` turns each step into text. `Collectors.joining("/", "/", "")` joins the steps with `/`, puts `/` at the start and nothing at the end. The comment names RFC 6901. A failure with an empty path would give `/`, but those failures (an empty body, a body that is not an object, trailing data) are caught by `read` before binding and reported at `""`.
+
+`escaped` writes a field name the way RFC 6901 asks: a `~` becomes `~0` and a `/` becomes `~1`. The order matters: escaping `/` first would turn `~1` into `~01`. Without it, an unknown field named `a/b` would be reported at `/a/b`, which points at a field `b` inside a field `a`.
 
 ```java
   /**
@@ -429,6 +486,7 @@ The first `reply` calls the second with no field errors. The second builds a `Pr
 ```java
 package io.plainround.seatwave.api.http;
 
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -441,12 +499,13 @@ import java.util.Objects;
  * @param status the HTTP status code
  * @param contentType the media type of the body, or an empty string when there is no body
  * @param body the body text, sent as UTF-8
- * @param headers further headers, in the order they are sent
+ * @param headers further headers, kept in the order they were added (the JDK server chooses the
+ *     order on the wire)
  */
 public record Reply(int status, String contentType, String body, Map<String, String> headers) {
 ```
 
-A `Reply` is a response ready to send: status, content type, body, extra headers. (The Javadoc says the headers are "in the order they are sent"; the constructor copies them with `Map.copyOf`, which does not keep an order, so the order is not guaranteed. Clients must not rely on header order anyway.)
+A `Reply` is a response ready to send: status, content type, body, extra headers. The Javadoc says the headers are kept in the order they were added, and that the JDK server chooses the order on the wire (its own header map does not keep an order). Clients must not rely on header order anyway.
 
 ```java
   static final String JSON = "application/json";
@@ -457,15 +516,16 @@ A `Reply` is a response ready to send: status, content type, body, extra headers
 Package-private constants for the two media types: `application/json` and `application/problem+json`. 204 means "No Content".
 
 ```java
-  /** Copies the headers and checks the fields. */
+  /** Copies the headers, keeping their order, and checks the fields. */
   public Reply {
     Objects.requireNonNull(contentType, "contentType");
     Objects.requireNonNull(body, "body");
-    headers = Map.copyOf(headers);
+    // Map.copyOf would lose the order; an unmodifiable copy of an ordered map keeps it.
+    headers = Collections.unmodifiableMap(new LinkedHashMap<>(headers));
   }
 ```
 
-The compact constructor checks `contentType` and `body` for `null` and copies the header map into an unchangeable one.
+The compact constructor checks `contentType` and `body` for `null` and copies the header map. `new LinkedHashMap<>(headers)` copies it into a map that remembers the order of insertion, and `Collections.unmodifiableMap(...)` wraps the copy so nobody can change it. The comment says why not `Map.copyOf`: that method makes an unchangeable map too, but in no fixed order, so the same headers could come out in another order on every run. `ReplyTest` checks the order.
 
 ```java
   static Reply json(int status, String body) {
@@ -613,14 +673,25 @@ final class Parameters {
 
 ```java
   static Result<Parameters, List<FieldError>> parse(String encoded, Set<String> allowedNames) {
-    Map<String, String> values = new LinkedHashMap<>();
     List<FieldError> errors = new ArrayList<>();
+    Parameters parameters = read(encoded, allowedNames, errors);
+    return errors.isEmpty() ? Result.success(parameters) : Result.error(List.copyOf(errors));
+  }
+
+  /**
+   * Reads every pair, adds one error per bad pair to {@code errors}, and keeps the good ones, so
+   * the caller can still check their values and report every problem in one reply.
+   *
+   * @return the allowed names with their first value
+   */
+  static Parameters read(String encoded, Set<String> allowedNames, List<FieldError> errors) {
+    Map<String, String> values = new LinkedHashMap<>();
     if (encoded.isEmpty()) {
-      return Result.success(new Parameters(values));
+      return new Parameters(values);
     }
 ```
 
-`parse` takes the encoded text and the set of allowed names, and returns `Result<Parameters, List<FieldError>>`: the parameters, or the list of errors. An empty text is a success with no parameters.
+There are two ways in. `parse` takes the encoded text and the set of allowed names, and returns `Result<Parameters, List<FieldError>>`: the parameters, or the list of errors. Version 0's routes use it. `read` does the work: it adds each error to the caller's list and always returns the parameters it could read, so a caller such as `CatalogRoutes` can still check the values and report every problem in one reply. `parse` is a thin wrapper around `read`: no error means success, otherwise `List.copyOf(errors)` hands back an unchangeable copy of the errors. An empty text gives no parameters and no error.
 
 ```java
     for (String pair : encoded.split("&", -1)) {
@@ -652,11 +723,11 @@ final class Parameters {
         errors.add(new FieldError(pair, "is not valid percent-encoding"));
       }
     }
-    return errors.isEmpty() ? Result.success(new Parameters(values)) : Result.error(errors);
+    return new Parameters(values);
   }
 ```
 
-A broken percent escape (`%zz`) makes `URLDecoder` throw `IllegalArgumentException`; it is the client's mistake and is reported. After the loop the method returns the errors if there are any, and the parameters if not. Note that one unknown name makes the whole parse fail, so the other parameters are not checked in the same run.
+A broken percent escape (`%zz`) makes `URLDecoder` throw `IllegalArgumentException`; it is the client's mistake and is reported. After the loop `read` returns the parameters it kept, whatever the errors were, so one unknown name no longer hides the other problems of the request.
 
 ```java
   Optional<String> get(String name) {
@@ -1110,9 +1181,10 @@ The constructor stores the catalog service, the JSON codec and `Problems`.
 ```java
   Reply listEvents(ApiRequest request) throws SQLException {
     List<FieldError> errors = new ArrayList<>();
-    Optional<Parameters> parameters = parameters(request, EVENT_PARAMETERS, errors);
-    Optional<Integer> limit = parameters.flatMap(found -> limitOf(found, errors));
-    Optional<Position> position = parameters.flatMap(found -> positionOf(found, errors));
+    // A bad name does not stop the value checks: every problem goes into one reply.
+    Parameters parameters = Parameters.read(request.rawQuery(), EVENT_PARAMETERS, errors);
+    Optional<Integer> limit = limitOf(parameters, errors);
+    Optional<Position> position = positionOf(parameters, errors);
     if (!errors.isEmpty()) {
       return problems.invalid(errors, request.correlationId());
     }
@@ -1127,7 +1199,7 @@ The constructor stores the catalog service, the JSON codec and `Problems`.
   }
 ```
 
-`listEvents`: it makes a list for errors and parses the query. `parameters.flatMap(found -> limitOf(found, errors))` runs only if the parse succeeded, and may add an error. The same for the position (the cursor). If any error was collected, the reply is `problems.invalid(errors, ...)`. Otherwise the service is called with `limit.orElseThrow()` and `position.orElseThrow()` (they are present when there is no error). The `switch` on the `Result`: a success becomes `Reply.json(200, ...)` where `events.map(V1Views.EventView::of)` converts each item and keeps the cursor; an error goes to `problemReply`.
+`listEvents`: it makes a list for errors and reads the query with `Parameters.read`, which adds a bad or unknown name to the list and keeps the good ones. `limitOf` and `positionOf` then check the values in every case and may add more errors, so `?limit=0&foo=1` is answered with both problems in one reply (the comment says so). If any error was collected, the reply is `problems.invalid(errors, ...)`. Otherwise the service is called with `limit.orElseThrow()` and `position.orElseThrow()` (they are present when there is no error). The `switch` on the `Result`: a success becomes `Reply.json(200, ...)` where `events.map(V1Views.EventView::of)` converts each item and keeps the cursor; an error goes to `problemReply`.
 
 ```java
   Reply listSeats(ApiRequest request) throws SQLException {
@@ -1136,10 +1208,10 @@ The constructor stores the catalog service, the JSON codec and `Problems`.
     if (!EVENT_ID.matcher(eventIdText).matches()) {
       errors.add(new FieldError("eventId", "must be a whole number of 1 or more"));
     }
-    Optional<Parameters> parameters = parameters(request, SEAT_PARAMETERS, errors);
-    Optional<SeatFilter> filter = parameters.flatMap(found -> filterOf(found, errors));
-    Optional<Integer> limit = parameters.flatMap(found -> limitOf(found, errors));
-    Optional<Position> position = parameters.flatMap(found -> positionOf(found, errors));
+    Parameters parameters = Parameters.read(request.rawQuery(), SEAT_PARAMETERS, errors);
+    Optional<SeatFilter> filter = filterOf(parameters, errors);
+    Optional<Integer> limit = limitOf(parameters, errors);
+    Optional<Position> position = positionOf(parameters, errors);
     if (!errors.isEmpty()) {
       return problems.invalid(errors, request.correlationId());
     }
@@ -1172,21 +1244,6 @@ The constructor stores the catalog service, the JSON codec and `Problems`.
 ```
 
 `problemReply` maps the two catalog problems: `EventNotFound()` becomes a 404 "no event has this id"; `BadCursor(detail)` becomes a 400 with a field error at the pointer `cursor`.
-
-```java
-  private static Optional<Parameters> parameters(
-      ApiRequest request, Set<String> allowed, List<FieldError> errors) {
-    return switch (Parameters.parse(request.rawQuery(), allowed)) {
-      case Result.Success<Parameters, List<FieldError>>(Parameters found) -> Optional.of(found);
-      case Result.Error<Parameters, List<FieldError>>(List<FieldError> bad) -> {
-        errors.addAll(bad);
-        yield Optional.empty();
-      }
-    };
-  }
-```
-
-`parameters` wraps `Parameters.parse`. On an error, the errors are added to the caller's list and the result is empty. `yield` returns a value from a block of a `switch` expression.
 
 ```java
   private static Optional<Integer> limitOf(Parameters parameters, List<FieldError> errors) {
@@ -2397,7 +2454,7 @@ Location: /v1/holds/3cf3931c-d0db-4905-ade4-98684267f96e
 {"type":"https://seatwave.example/problems/invalid-request","title":"The request does not match the contract","status":400,"detail":"one field is invalid","instance":"urn:uuid:8baa4cf7-acaf-4e94-99ab-c5249c66cf85","errors":[{"pointer":"/eventId","detail":"has the wrong type"}]}
 ```
 
-   Command: `curl -s -X POST http://127.0.0.1:28187/v1/holds -H 'Content-Type: application/json' -H 'Idempotency-Key: "k-2"' -d '{"eventId":"1","seat":"A-7","customer":"fan_7"}'`. A float (`1.5`) gave the same reply; a duplicate field gave pointer `""` and "the body is not valid JSON"; `{}` gave three errors at once (`/eventId`, `/seat`, `/customer`) and the detail "3 fields are invalid".
+   Command: `curl -s -X POST http://127.0.0.1:28187/v1/holds -H 'Content-Type: application/json' -H 'Idempotency-Key: "k-2"' -d '{"eventId":"1","seat":"A-7","customer":"fan_7"}'`. A float (`1.5`) gave the same reply, and so did a number for the text field `customer` (pointer `/customer`); `[1]` gave pointer `""` and "the body must be a JSON object"; a duplicate field gave pointer `""` and "the body is not valid JSON"; `{}` gave three errors at once (`/eventId`, `/seat`, `/customer`) and the detail "3 fields are invalid".
 
 3. A path that does not exist, and a method the path does not take:
 
@@ -2440,7 +2497,7 @@ Content-length: 6989
 Link: </v1/events>; rel="successor-version"
 ```
 
-   Look at the order of the headers: it is not the order the code adds them. That confirms the header order is not guaranteed.
+   Look at the order of the headers: it is not the order the code adds them. `Reply` keeps the order they were added in (`ReplyTest` checks it), but the JDK server copies them into its own header map, which keeps no order, so the order on the wire is not guaranteed. I ran this again after that change to `Reply` and got the same order.
 
 6. The metrics after these calls (first lines):
 

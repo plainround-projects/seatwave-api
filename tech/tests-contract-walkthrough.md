@@ -61,8 +61,9 @@ import java.util.Set;
 
 /**
  * The checks a SeatWave contract must pass before any code is written: the OpenAPI parser's own
- * validation (structure, types, references), then the house rules this module teaches. Used by the
- * build's tests and by the {@code lintContract} task.
+ * validation (structure, types, references), then the house rules this module teaches: errors are
+ * problem details, writes require an Idempotency-Key, pages have a ceiling and a cursor, and every
+ * required field is defined. Used by the build's tests and by the {@code lintContract} task.
  */
 public final class ContractRules {
 
@@ -77,8 +78,8 @@ public final class ContractRules {
 
 - Lines 3 to 12 import the Swagger Parser and its object model. `OpenAPIParser` reads text. `OpenAPI` is the whole document as an object. `Operation` is one method on one path. `PathItem` is one path with its methods. `Content` is the map from media type to schema, `Schema` is a JSON Schema, `Parameter` is a query or header parameter and `ApiResponse` is one entry under `responses`. `ParseOptions` holds the reader's settings and `SwaggerParseResult` is what it returns.
 - Lines 13 to 20 import ordinary JDK classes: `BigDecimal` (exact decimal numbers), lists, sets, maps, `Objects` and `Optional`.
-- The Javadoc (lines 22 to 26) is the class's manual. `{@code lintContract}` marks a code word. It says the class is used both by the build's tests and by the `lintContract` task.
-- `public final class ContractRules` is a class nobody can extend. `private ContractRules() {}` (line 35) is a constructor nobody can call: the class only has static methods, so no instance is ever made.
+- The Javadoc (lines 22 to 27) is the class's manual. It names the house rules: errors are problem details, writes require an `Idempotency-Key`, pages have a ceiling and a cursor, and every required field is defined. `{@code lintContract}` marks a code word. It says the class is used both by the build's tests and by the `lintContract` task.
+- `public final class ContractRules` is a class nobody can extend. `private ContractRules() {}` (line 36) is a constructor nobody can call: the class only has static methods, so no instance is ever made.
 - `MAX_PAGE_LIMIT = 500` is the largest page any collection may promise. A test compares it with the code's own constant (`OpenApiDocumentTest.publishesTheSameLimitsTheCodeEnforces`).
 - `PROBLEM_JSON` is the media type of every error body (RFC 9457). `FIRST_ERROR_STATUS = 400` is the first status number that counts as an error.
 
@@ -125,9 +126,9 @@ public final class ContractRules {
 - `new OpenAPIParser().readContents(text, null, options)` reads the document. The second argument (`null`) is a list of authorization values for remote files, and there are none.
 - `Optional.ofNullable(parsed.getMessages()).ifPresent(messages -> messages.forEach(message -> problems.add("parser: " + message)))` copies the parser's own complaints into the list with the prefix `parser: `. `Optional.ofNullable` wraps a value that may be `null`; `ifPresent` runs the lambda only when it is there.
 - `parsed.getOpenAPI()` is the document object. If it is `null` the text could not be read at all, so the method adds that message and returns early.
-- Line 57 checks the version: `document.getOpenapi()` is the text after `openapi:` at the top of the file. It must start with `3.1.`. If it is missing or says something else, the problem names what it found.
+- Line 58 checks the version: `document.getOpenapi()` is the text after `openapi:` at the top of the file. It must start with `3.1.`. If it is missing or says something else, the problem names what it found.
 - `Set<String> operationIds = new HashSet<>()` remembers the operation ids seen so far. A set refuses duplicates, which is how the next method tests uniqueness.
-- Lines 61 to 66 go through every path and every method on it. `item.readOperationsMap()` returns a map from the method (`GET`, `POST`) to its `Operation`. For each pair, `checkOperation` runs. The nesting of lambdas is `paths.forEach((path, item) -> item.readOperationsMap().forEach((method, operation) -> checkOperation(...)))`.
+- Lines 62 to 67 go through every path and every method on it. `item.readOperationsMap()` returns a map from the method (`GET`, `POST`) to its `Operation`. For each pair, `checkOperation` runs. The nesting of lambdas is `paths.forEach((path, item) -> item.readOperationsMap().forEach((method, operation) -> checkOperation(...)))`.
 
 #### `checkOperation`: the rules for one operation
 
@@ -163,16 +164,52 @@ public final class ContractRules {
     if (method == PathItem.HttpMethod.GET && returnsPage(responses)) {
       checkPagination(name, operation, problems);
     }
+    Optional.ofNullable(operation.getRequestBody())
+        .ifPresent(body -> checkRequiredFields(name + " request", body.getContent(), problems));
+    responses.forEach((status, response) ->
+        checkRequiredFields(name + " " + status, response.getContent(), problems));
+  }
+
+  private static void checkRequiredFields(String where, Content content, List<String> problems) {
+    Optional.ofNullable(content)
+        .ifPresent(mediaTypes ->
+            mediaTypes
+                .values()
+                .forEach(mediaType -> checkRequiredFields(where, mediaType.getSchema(), problems)));
+  }
+
+  private static void checkRequiredFields(String where, Schema<?> schema, List<String> problems) {
+    if (schema == null) {
+      return;
+    }
+    // The parser accepts a required name with no definition; a client cannot know what to send.
+    Set<String> defined =
+        schema.getProperties() == null ? Set.of() : schema.getProperties().keySet();
+    for (String required : Objects.requireNonNullElse(schema.getRequired(), List.<String>of())) {
+      if (!defined.contains(required)) {
+        problems.add("rule: " + where + ": required field " + required + " is not defined");
+      }
+    }
+    if (schema.getProperties() != null) {
+      schema
+          .getProperties()
+          .forEach(
+              (field, property) -> checkRequiredFields(where + "." + field, property, problems));
+    }
+    checkRequiredFields(where + "[]", schema.getItems(), problems);
   }
 ```
 
 - `String name = method + " " + path` builds a label such as `POST /v1/holds`, used in every message.
-- Rule 1, line 77: `operation.getOperationId() == null || !operationIds.add(operation.getOperationId())`. A set's `add` returns `false` when the id was already there. So the message `needs a unique operationId` appears when there is no id or when it repeats.
-- Lines 80 to 83: `Boolean.TRUE.equals(operation.getDeprecated())` is the null-safe way to ask "is it deprecated?" (the field may be `null`). A deprecated operation is a version 0 path that keeps its old shapes on purpose (the comment on line 81), so the remaining rules are skipped with `return`.
-- Lines 84 to 85 copy the responses into a map that cannot be changed: `Optional.ofNullable(operation.getResponses()).map(Map::copyOf).orElse(Map.of())`.
-- Lines 86 to 92: for each response, `status.matches("[0-9]{3}")` is true when the key is a three-digit number (a key such as `default` is not), and `Integer.parseInt(status) >= FIRST_ERROR_STATUS` is true for 400 and above. Rule 2: every error response must be a problem (`isProblem`), or the message `must be application/problem+json Problem` appears.
-- Lines 93 to 97, Rule 3: a `POST` that has a request body must require the `Idempotency-Key` header, or the message says `creates something, so it must require Idempotency-Key`.
-- Lines 98 to 100, Rule 4: a `GET` that returns a page (`returnsPage`) is checked by `checkPagination`.
+- Rule 1, line 78: `operation.getOperationId() == null || !operationIds.add(operation.getOperationId())`. A set's `add` returns `false` when the id was already there. So the message `needs a unique operationId` appears when there is no id or when it repeats.
+- Lines 81 to 84: `Boolean.TRUE.equals(operation.getDeprecated())` is the null-safe way to ask "is it deprecated?" (the field may be `null`). A deprecated operation is a version 0 path that keeps its old shapes on purpose (the comment on line 82), so the remaining rules are skipped with `return`.
+- Lines 85 to 86 copy the responses into a map that cannot be changed: `Optional.ofNullable(operation.getResponses()).map(Map::copyOf).orElse(Map.of())`.
+- Lines 87 to 93: for each response, `status.matches("[0-9]{3}")` is true when the key is a three-digit number (a key such as `default` is not), and `Integer.parseInt(status) >= FIRST_ERROR_STATUS` is true for 400 and above. Rule 2: every error response must be a problem (`isProblem`), or the message `must be application/problem+json Problem` appears.
+- Lines 94 to 98, Rule 3: a `POST` that has a request body must require the `Idempotency-Key` header, or the message says `creates something, so it must require Idempotency-Key`.
+- Lines 99 to 101, Rule 4: a `GET` that returns a page (`returnsPage`) is checked by `checkPagination`.
+- Lines 102 to 105, Rule 5: the request body and every response are handed to `checkRequiredFields`, with a label such as `POST /v1/holds request` or `POST /v1/holds 201`.
+- The first `checkRequiredFields` takes a `Content` (the map from media type to schema). If there is one, it checks the schema of each media type.
+- The second `checkRequiredFields` takes one schema. A `null` schema (for example a reference to a schema that does not exist, which the parser has already reported) is skipped. `defined` is the set of names in `properties`, or an empty set when there are none. Every name in `required` must be in that set, or the message is `required field NAME is not defined`. The comment says why the rule exists: the parser accepts a required name with no definition, but a client cannot know what to send. The method then calls itself on each property and on the array element schema (`getItems()`, label `[]`), so nested objects are checked too. This is the rule that finds the fourth mistake of the Lab 1 draft.
 
 #### `checkPagination`, `returnsPage`
 
@@ -201,8 +238,8 @@ public final class ContractRules {
 ```
 
 - `parameter(operation, "limit")` finds the query parameter called `limit`. `limit.map(Parameter::getSchema).map(schema -> schema.getMaximum()).orElse(BigDecimal.ZERO)` reads its schema's `maximum`, or `0` when there is none. `Parameter::getSchema` is a method reference.
-- Line 107: the rule fails when there is no `limit`, or its maximum is zero or below (`maximum.signum() <= 0`; `signum` is -1, 0 or 1), or it is above 500. The message says `limit needs a maximum of at most 500`.
-- Lines 110 to 112: a page also needs a `cursor` query parameter.
+- Line 141: the rule fails when there is no `limit`, or its maximum is zero or below (`maximum.signum() <= 0`; `signum` is -1, 0 or 1), or it is above 500. The message says `limit needs a maximum of at most 500`.
+- Lines 144 to 146: a page also needs a `cursor` query parameter.
 - `returnsPage` answers "does the `200` reply have a JSON object with a property called `items`?" by walking down `responses.get("200")`, its `content`, the `application/json` entry, its `schema`, and the schema's `properties`. At any missing step the `Optional` turns into `false`. That is how the rule finds the operations that return a page without a list of names.
 
 #### `isProblem`, `requiresHeader`, `parameter`
@@ -303,6 +340,7 @@ import io.swagger.parser.OpenAPIParser;
 import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.Operation;
 import io.swagger.v3.oas.models.PathItem;
+import io.swagger.v3.oas.models.media.Content;
 import io.swagger.v3.oas.models.media.MediaType;
 import io.swagger.v3.oas.models.media.Schema;
 import io.swagger.v3.oas.models.parameters.Parameter;
@@ -313,6 +351,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.BiConsumer;
 
 /**
  * The house breaking-change check, next to openapi-diff: a candidate contract breaks a released one
@@ -321,18 +360,23 @@ import java.util.Optional;
  *
  * <ul>
  *   <li>no operation and no documented status code disappears;
- *   <li>no response field disappears, changes type or stops being required;
+ *   <li>no response field disappears, changes type or stops being required, and no response gains
+ *       an allowed value (a client that switches over the known values has no branch for it);
  *   <li>no request field disappears (a client sends it, and unknown fields are refused) or changes
  *       type, no new request field or parameter is required, and no allowed value is removed.
  * </ul>
+ *
+ * <p>A removed response value is not on the list: a client never fails because a value stops
+ * arriving. Each media type is compared with the same media type of the candidate, by name.
  */
 public final class BreakingChanges {
 
   private BreakingChanges() {}
 ```
 
-- The imports are the same Swagger Parser classes as in `ContractRules`, plus `MediaType` (one entry of a `content` map).
-- The Javadoc names the three rule groups: operations and status codes must not disappear; response fields must not disappear, change type or stop being required; request fields must not disappear or change type, no new request field or parameter may be required, and no allowed value may be removed. The reason for the request side is in the text: a client sends the old field, and the service refuses unknown fields.
+- The imports are the same Swagger Parser classes as in `ContractRules`, plus `Content` (a `content` map), `MediaType` (one entry of it) and `BiConsumer` (a function that takes two values and returns nothing).
+- The Javadoc names the three rule groups: operations and status codes must not disappear; response fields must not disappear, change type or stop being required, and a response must not gain an allowed value; request fields must not disappear or change type, no new request field or parameter may be required, and no allowed value may be removed. The reasons are in the text: a client that switches over the values it knows has no branch for a new one; a client sends the old field, and the service refuses unknown fields.
+- The last paragraph states two choices. A value removed from a response is not breaking, because a client never fails when a value stops arriving. And each media type is compared with the media type of the same name in the candidate.
 - `<ul>` and `<li>` are HTML list tags that Javadoc turns into a bulleted list.
 
 #### `find`: walk the released document
@@ -394,22 +438,20 @@ public final class BreakingChanges {
     }
 ```
 
-- First loop (lines 61 to 68): for each parameter of the candidate, `wasThere` is true if a parameter of the same name existed before. A **required** parameter that is new breaks old clients, which never send it. The message is `new required parameter NAME`.
-- Second loop (lines 69 to 79): for each old parameter, find the candidate's parameter with the same name (`findFirst`) and, if it exists, compare the two schemas as a **request** (`compareRequest`), because a client sends parameters. The label passed in names the parameter: `GET /v1/events/{eventId}/seats parameter state`.
+- First loop (lines 67 to 74): for each parameter of the candidate, `wasThere` is true if a parameter of the same name existed before. A **required** parameter that is new breaks old clients, which never send it. The message is `new required parameter NAME`.
+- Second loop (lines 75 to 85): for each old parameter, find the candidate's parameter with the same name (`findFirst`) and, if it exists, compare the two schemas as a **request** (`compareRequest`), because a client sends parameters. The label passed in names the parameter: `GET /v1/events/{eventId}/seats parameter state`.
 
 ```java
-    Optional.ofNullable(before.getRequestBody())
-        .map(body -> jsonSchema(body.getContent()))
-        .flatMap(schema -> schema)
-        .ifPresent(oldSchema ->
-            Optional.ofNullable(after.getRequestBody())
-                .flatMap(body -> jsonSchema(body.getContent()))
-                .ifPresent(
-                    newSchema -> compareRequest(name + " request", oldSchema, newSchema, breaks)));
+    if (before.getRequestBody() != null && after.getRequestBody() != null) {
+      compareContent(
+          before.getRequestBody().getContent(),
+          after.getRequestBody().getContent(),
+          (oldSchema, newSchema) ->
+              compareRequest(name + " request", oldSchema, newSchema, breaks));
+    }
 ```
 
-- The request body: `Optional.ofNullable(before.getRequestBody())` is the old body, `.map(body -> jsonSchema(body.getContent()))` turns it into the schema of its JSON content (itself an `Optional`), and `.flatMap(schema -> schema)` flattens the two layers of `Optional` into one.
-- If the old operation had a JSON body schema, the same is read from the candidate, and `compareRequest(name + " request", oldSchema, newSchema, breaks)` compares them. If the candidate has no body, nothing is compared (that case, a removed body, is not a rule in this file).
+- The request body: when both operations have one, `compareContent` (in the helpers) pairs each media type of the old body with the media type of the same name in the new one, and calls the function it is given on each pair of schemas. The function is a **lambda**, `(oldSchema, newSchema) -> compareRequest(name + " request", oldSchema, newSchema, breaks)`: a short unnamed function, here one that compares two request schemas. If the candidate has no body, nothing is compared (that case, a removed body, is not a rule in this file).
 
 ```java
     Map<String, ApiResponse> newResponses = mapOf(after.getResponses());
@@ -420,17 +462,17 @@ public final class BreakingChanges {
             breaks.add(name + ": response " + status + " was removed");
             return;
           }
-          jsonSchema(response.getContent())
-              .ifPresent(oldSchema ->
-                  jsonSchema(next.getContent())
-                      .ifPresent(newSchema ->
-                          compareResponse(name + " " + status, oldSchema, newSchema, breaks)));
+          compareContent(
+              response.getContent(),
+              next.getContent(),
+              (oldSchema, newSchema) ->
+                  compareResponse(name + " " + status, oldSchema, newSchema, breaks));
         });
   }
 ```
 
 - The responses: `newResponses` is the candidate's map from status code to response (`mapOf` makes a missing map empty).
-- For each status code the released document documents: if the candidate does not, the message is `response STATUS was removed`. Otherwise, if both have a JSON schema, `compareResponse` compares them. The `return` inside the lambda leaves only the current iteration.
+- For each status code the released document documents: if the candidate does not, the message is `response STATUS was removed`. Otherwise `compareContent` pairs the media types by name, and `compareResponse` compares each pair of schemas. The `return` inside the lambda leaves only the current iteration.
 
 #### `compareResponse`: what a client reads
 
@@ -444,6 +486,13 @@ public final class BreakingChanges {
     for (String required : listOf(before.getRequired())) {
       if (!listOf(after.getRequired()).contains(required)) {
         breaks.add(where + ": field " + required + " is no longer always present");
+      }
+    }
+    if (before.getEnum() != null) {
+      for (Object allowed : listOf(after.getEnum())) {
+        if (!before.getEnum().contains(allowed)) {
+          breaks.add(where + ": the value " + allowed + " is new, so clients may not know it");
+        }
       }
     }
     mapOf(before.getProperties())
@@ -463,8 +512,9 @@ public final class BreakingChanges {
 
 - `typeOf` (below) gives the type name of each schema. If they differ (an integer became a string), the message is `type changed from X to Y` and the method stops: nothing below makes sense.
 - For every field that was `required` in the old schema, the candidate must still list it as required. A client may rely on a field always being present, so `field NAME is no longer always present` is breaking.
+- If the old schema lists allowed values (an `enum`), every value of the candidate's enum must be one of them, or the message is `the value VALUE is new, so clients may not know it`. A client written against the old list may have a branch for each value it knows and none for a new one. The opposite direction is fine for a response: a value that stops arriving never makes a client fail, so it is not checked.
 - For every old property: if the candidate no longer has it, the message is `field NAME was removed`. If it has, the method calls itself on the field's schema with a longer label (`where + "." + field`). That is **recursion**: the same check goes down through nested objects.
-- Lines 124 to 126 do the same for arrays: `getItems()` is the schema of one array element, and the label gets `[]` (`200.items[]`).
+- Lines 136 to 138 do the same for arrays: `getItems()` is the schema of one array element, and the label gets `[]` (`200.items[]`).
 
 #### `compareRequest`: what a client sends
 
@@ -499,8 +549,8 @@ public final class BreakingChanges {
 
 - A changed type is breaking here as well.
 - For every field the **candidate** requires that the released schema did not, the message is `field NAME is newly required`. This is the mirror image of the response rule: clients send what the old document said, so a new mandatory field makes their requests invalid.
-- Lines 140 to 144: for every allowed value in the old `enum`, if the candidate has an enum and it no longer lists the value, the message is `the value VALUE is no longer allowed`. `Object allowed` is used because an enum list can hold any kind of value.
-- Lines 145 to 153: every old field must still exist, or `field NAME was removed, so clients that send it fail`. The explanation in the message is the key fact of this API: the service refuses unknown fields, so a client that still sends the old field would be rejected. If the field exists, the check recurses into it.
+- Lines 152 to 156: for every allowed value in the old `enum`, if the candidate has an enum and it no longer lists the value, the message is `the value VALUE is no longer allowed`. `Object allowed` is used because an enum list can hold any kind of value.
+- Lines 157 to 165: every old field must still exist, or `field NAME was removed, so clients that send it fail`. The explanation in the message is the key fact of this API: the service refuses unknown fields, so a client that still sends the old field would be rejected. If the field exists, the check recurses into it.
 
 #### Helpers
 
@@ -511,19 +561,22 @@ public final class BreakingChanges {
         .map(item -> item.readOperationsMap().get(method));
   }
 
-  private static Optional<Schema<?>> jsonSchema(io.swagger.v3.oas.models.media.Content content) {
-    if (content == null) {
-      return Optional.empty();
-    }
-    return content.values().stream()
-        .findFirst()
-        .map(MediaType::getSchema)
-        .map(schema -> (Schema<?>) schema);
+  private static void compareContent(
+      Content before, Content after, BiConsumer<Schema<?>, Schema<?>> comparison) {
+    // A client reads the media type it asked for, so each one is compared with its namesake; a
+    // reply with two media types must not be judged by whichever the document lists first.
+    mapOf(before)
+        .forEach((mediaType, released) -> {
+          MediaType candidate = mapOf(after).get(mediaType);
+          if (candidate != null && released.getSchema() != null && candidate.getSchema() != null) {
+            comparison.accept(released.getSchema(), candidate.getSchema());
+          }
+        });
   }
 ```
 
 - `operation(document, path, method)` returns the operation of the same path and method as an `Optional`, empty when the path or method is missing.
-- `jsonSchema(content)` takes the first media type of a `content` map (`values().stream().findFirst()`), reads its schema (`MediaType::getSchema`) and casts it to `Schema<?>`. It is `Optional.empty()` when there is no content. It does not look for `application/json` by name; it takes the first entry, which is enough for this contract because each of its bodies has one media type.
+- `compareContent(before, after, comparison)` walks the released `content` map. For each media type (for example `application/json`), `mapOf(after).get(mediaType)` looks up the media type **of the same name** in the candidate. When both exist and both have a schema, `comparison.accept(old, new)` runs the comparison it was given. The comment says why the lookup is by name: a client reads the media type it asked for, and a reply with two media types must not be judged by whichever the document lists first. (An earlier version took the first entry of each map, so a candidate that put an unchanged media type first hid a change in `application/json`; `comparesEachMediaTypeWithTheSameOneByName` is that case.) A media type that only the candidate has is new and harmless, so it is not looked at.
 
 ```java
   private static String typeOf(Schema<?> schema) {
@@ -567,6 +620,10 @@ package io.plainround.seatwave.api.contract;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.plainround.seatwave.api.Contract;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 
@@ -586,6 +643,7 @@ class BreakingChangeTest {
   }
 ```
 
+- The imports add `IOException`, `UncheckedIOException`, `StandardCharsets` and `Files` for the helper `writeTo` at the end, which writes a candidate made in memory to a file for openapi-diff.
 - The class is package-private (`class BreakingChangeTest`, no `public`). The Javadoc is its one-sentence requirement.
 - `RELEASED` is the path of the released contract. `System.getProperty("seatwave.releasedContract", "openapi/released/seatwave-api-1.0.0.yaml")` reads the property that `build.gradle.kts` sets, and has the same file as the fallback.
 - Test 1 (`keepsEveryClientOfTheReleasedContractWorking`): the current contract (`Contract.DOCUMENT`) is compared with the released one by openapi-diff (`DiffContractCli.compare(...).isCompatible()` must be true) **and** by the house rules (`BreakingChanges.find(...)` must return an empty list). Two independent checks must both agree.
@@ -636,7 +694,6 @@ Test 3: the file `seatwave-api-1.1.0-breaking.yaml` renames the response field `
             assertThat(change).contains("GET /v1/bookings/{bookingId}: the operation was removed"))
         .anySatisfy(change -> assertThat(change).contains("the value held is no longer allowed"));
   }
-}
 ```
 
 Test 4 builds a candidate from the released text in memory with `String.replace`:
@@ -644,6 +701,155 @@ Test 4 builds a candidate from the released text in memory with `String.replace`
 - It removes `held` from the enum of seat states, `enum: [available, held, sold]` to `enum: [available, sold]`.
 
 `BreakingChanges.find(released, candidate)` must report `GET /v1/bookings/{bookingId}: the operation was removed` and `the value held is no longer allowed`. The `held` value is found through the `state` query parameter of the seats operation, which uses the enum as its schema. This test never calls openapi-diff: it checks the house rules only.
+
+#### Three rules that had no test
+
+```java
+  @Test
+  void refusesARemovedStatusARemovedRequestFieldAndANewRequiredParameter() {
+    String released = Contract.text(RELEASED);
+    String candidate =
+        replaceOnce(
+            replaceOnce(
+                replaceOnce(
+                    replaceOnce(
+                        released,
+                        "        '422':\n"
+                            + "          $ref: '#/components/responses/KeyReused'\n"
+                            + "        '503':\n"
+                            + "          $ref: '#/components/responses/Unavailable'\n"
+                            + "  /v1/holds/{holdId}:\n",
+                        "        '503':\n"
+                            + "          $ref: '#/components/responses/Unavailable'\n"
+                            + "  /v1/holds/{holdId}:\n"),
+                    "    HoldRequest:\n"
+                        + "      type: object\n"
+                        + "      additionalProperties: false\n"
+                        + "      required: [eventId, seat, customer]\n",
+                    "    HoldRequest:\n"
+                        + "      type: object\n"
+                        + "      additionalProperties: false\n"
+                        + "      required: [eventId, seat]\n"),
+                "        customer:\n"
+                    + "          type: string\n"
+                    + "          pattern: '^[A-Za-z0-9_-]{1,64}$'\n",
+                ""),
+            "      summary: Read a hold and its state.\n"
+                + "      parameters:\n"
+                + "        - $ref: '#/components/parameters/HoldId'\n",
+            "      summary: Read a hold and its state.\n"
+                + "      parameters:\n"
+                + "        - $ref: '#/components/parameters/HoldId'\n"
+                + "        - name: X-Client\n"
+                + "          in: header\n"
+                + "          required: true\n"
+                + "          schema:\n"
+                + "            type: string\n");
+
+    assertThat(BreakingChanges.find(released, candidate))
+        .contains(
+            "POST /v1/holds: response 422 was removed",
+            "POST /v1/holds request: field customer was removed, so clients that send it fail",
+            "GET /v1/holds/{holdId}: new required parameter X-Client");
+  }
+```
+
+Test 5 makes one candidate with four edits, each by `replaceOnce` (a helper below that also checks the text to replace is there exactly once). The calls are nested: the innermost edit runs first, and each result is the text of the next.
+- It removes the `'422'` entry of `POST /v1/holds`, the lines just before the path `/v1/holds/{holdId}:`. Each string is one YAML line ending in `\n`, joined with `+`.
+- It removes `customer` from the `required` list of `HoldRequest`, and then its property (an empty replacement deletes the three lines). The `HoldRequest:` lines are part of the text to replace because the line `required: [eventId, seat, customer]` also appears in the version 0 form body; `replaceOnce` would refuse an edit that is not unique.
+- It adds a required header parameter, `X-Client`, to `GET /v1/holds/{holdId}`.
+
+`.contains(...)` with three lines checks that the list holds all three messages, word for word: `response 422 was removed`, `field customer was removed, so clients that send it fail` and `new required parameter X-Client`. These are the three rules of the class Javadoc that no test exercised before.
+
+#### Allowed values in a response, and media types by name
+
+```java
+  @Test
+  void refusesANewResponseValueButAcceptsARemovedOne() {
+    String released = Contract.text(RELEASED);
+    String holdStates = "enum: [held, confirming, confirmed, cancelled, expired]";
+    String added =
+        replaceOnce(
+            released, holdStates, "enum: [held, confirming, confirmed, cancelled, expired, sold]");
+    String removed =
+        replaceOnce(released, holdStates, "enum: [held, confirming, confirmed, cancelled]");
+
+    assertThat(BreakingChanges.find(released, added))
+        .anySatisfy(change -> assertThat(change).contains(".state: the value sold is new"));
+    // A client never fails because a value stops arriving; openapi-diff agrees.
+    assertThat(BreakingChanges.find(released, removed)).isEmpty();
+    assertThat(DiffContractCli.compare(RELEASED, writeTo(removed)).isCompatible()).isTrue();
+  }
+```
+
+Test 6 changes the allowed values of a hold's `state`, a field that only replies carry.
+- `added` puts a new value, `sold`, in the list. The house rules must report `.state: the value sold is new`: a client that switches over the five known states has no branch for a sixth.
+- `removed` takes `expired` out. The comment says why that is not breaking: a client never fails because a value stops arriving. The house rules must report nothing, and openapi-diff, which reads files, must call it compatible too (`writeTo` writes the text to a temporary file first).
+
+```java
+  @Test
+  void comparesEachMediaTypeWithTheSameOneByName() {
+    String released = Contract.text(RELEASED);
+    // The candidate lists an unchanged media type first and drops fields from application/json.
+    String candidate =
+        replaceOnce(
+            released,
+            "          content:\n"
+                + "            application/json:\n"
+                + "              schema:\n"
+                + "                $ref: '#/components/schemas/Hold'\n"
+                + "        '400':\n"
+                + "          $ref: '#/components/responses/BadRequest'\n"
+                + "        '404':\n"
+                + "          $ref: '#/components/responses/NotFound'\n"
+                + "        '409':\n",
+            "          content:\n"
+                + "            application/vnd.seatwave+json:\n"
+                + "              schema:\n"
+                + "                $ref: '#/components/schemas/Hold'\n"
+                + "            application/json:\n"
+                + "              schema:\n"
+                + "                type: object\n"
+                + "                required: [holdId]\n"
+                + "                properties:\n"
+                + "                  holdId:\n"
+                + "                    type: string\n"
+                + "        '400':\n"
+                + "          $ref: '#/components/responses/BadRequest'\n"
+                + "        '404':\n"
+                + "          $ref: '#/components/responses/NotFound'\n"
+                + "        '409':\n");
+
+    assertThat(BreakingChanges.find(released, candidate))
+        .contains("POST /v1/holds 201: field eventId is no longer always present");
+  }
+```
+
+Test 7: the `201` reply of `POST /v1/holds` gets a second media type, `application/vnd.seatwave+json`, listed **first** and unchanged, and its `application/json` schema loses every field but `holdId`. The comment states the setup. A check that compared only the first media type of each side would compare the released `application/json` with the unchanged `vnd` entry and see nothing. Comparing by name, the house rules must find that `eventId` (among others) is no longer always present.
+
+#### The helpers
+
+```java
+  private static String replaceOnce(String text, String target, String replacement) {
+    // A test edit that matches nothing would test the released document against itself.
+    assertThat(text).containsOnlyOnce(target);
+    return text.replace(target, replacement);
+  }
+
+  private static Path writeTo(String document) {
+    try {
+      Path file = Files.createTempFile("seatwave-candidate-", ".yaml");
+      file.toFile().deleteOnExit();
+      return Files.writeString(file, document, StandardCharsets.UTF_8);
+    } catch (IOException failure) {
+      throw new UncheckedIOException(failure);
+    }
+  }
+}
+```
+
+- `replaceOnce(text, target, replacement)` first asserts `containsOnlyOnce(target)`: the text to replace is there, exactly once. The comment says why: an edit that matched nothing would leave the released document unchanged, and the test would compare it with itself and prove nothing.
+- `writeTo(document)` writes a candidate to a new temporary file (`Files.createTempFile`) in UTF-8, marks it to be deleted when the JVM ends (`deleteOnExit`), and returns its path, because `DiffContractCli.compare` takes paths. An `IOException` is a failure of the machine, not of the test's subject, so it is rethrown unchecked with the original as its cause.
 
 ### `OpenApiDocumentTest.java`
 
@@ -759,7 +965,10 @@ Three bad replies; the build must notice each. `Contract.judgeReply(method, path
     assertThat(ContractRules.check(broken))
         .anySatisfy(problem -> assertThat(problem).contains("Idempotency-Key"))
         .anySatisfy(problem -> assertThat(problem).contains("409 must be application/problem+json"))
-        .anySatisfy(problem -> assertThat(problem).startsWith("parser:"));
+        .anySatisfy(problem -> assertThat(problem).startsWith("parser:"))
+        .anySatisfy(problem ->
+            assertThat(problem)
+                .isEqualTo("rule: POST /v1/holds request: required field customer is not defined"));
   }
 
   @Test
@@ -770,7 +979,7 @@ Three bad replies; the build must notice each. `Contract.judgeReply(method, path
 }
 ```
 
-- `openapi/examples/holds-entry-broken.yaml` is a lab file with deliberate mistakes. The lint must say that `Idempotency-Key` is missing, that the 409 is not a problem body, and that the parser itself complained (a line that starts with `parser:`).
+- `openapi/examples/holds-entry-broken.yaml` is a lab file with four deliberate mistakes. The lint must say that `Idempotency-Key` is missing, that the 409 is not a problem body, that the parser itself complained (a line that starts with `parser:`, for the missing `Hold` schema), and, word for word, that `customer` is required but never defined: `rule: POST /v1/holds request: required field customer is not defined`.
 - `openapi/examples/holds-entry.yaml` is the lab solution. The lint must return an empty list.
 
 ### `DiffContractCli.java`
@@ -1130,7 +1339,45 @@ For each row:
 
 A single request with no key and three bad fields (`eventId` 0, `seat` `Z-9`, `customer` `a b`) gets one problem body whose `errors` list names **all four**. The test checks that the body contains `"pointer":"Idempotency-Key"`, `"pointer":"/eventId"`, `"pointer":"/seat"` and `"pointer":"/customer"`, and `"instance":"urn:uuid:` (the id of this occurrence of the problem). A **pointer** says where the fault is: a header name, or a JSON Pointer such as `/seat`.
 
-#### Test 3: a body that is too large or not JSON
+#### Test 3: a number where the contract wants text
+
+```java
+  @Test
+  void refusesANumberSentForTheCustomerAndHoldsNothing() throws Exception {
+    TestApi.Response reply =
+        api.send(
+            "POST",
+            "/v1/holds",
+            TestApi.jsonWithKey("number-customer"),
+            "{\"eventId\":1,\"seat\":\"A-1\",\"customer\":5}");
+
+    assertThat(reply.status()).isEqualTo(HttpStatus.BAD_REQUEST);
+    assertThat(reply.body())
+        .contains("{\"pointer\":\"/customer\",\"detail\":\"has the wrong type\"}");
+    assertThat(api.count("SELECT COUNT(*) FROM seats WHERE status = 'HELD'")).isZero();
+  }
+```
+
+A hold whose `customer` is the number `5` instead of a string. The contract says `customer` is a string, so the reply must be `400`, and its `errors` list must hold exactly `{"pointer":"/customer","detail":"has the wrong type"}`. The last line asks the database directly: no seat may be `HELD`, because a refused request does no work. (Before the fix in `JsonCodec`, this request was answered `201` and the hold was stored for the customer `"5"`.)
+
+#### Test 4: a bad name and a bad value in one reply
+
+```java
+  @Test
+  void reportsAnUnknownParameterAndABadValueInOneProblem() throws Exception {
+    TestApi.Response reply = api.send("GET", "/v1/events?limit=0&foo=1", NO_HEADERS, "");
+
+    assertThat(reply.status()).isEqualTo(HttpStatus.BAD_REQUEST);
+    assertThat(reply.body())
+        .contains("\"detail\":\"2 fields are invalid\"")
+        .contains("\"pointer\":\"limit\"")
+        .contains("\"pointer\":\"foo\"");
+  }
+```
+
+`GET /v1/events?limit=0&foo=1` has two faults: `foo` is not a parameter of this endpoint, and `limit=0` is below the minimum of 1. The reply must be one `400` whose `detail` is `2 fields are invalid` and whose `errors` name both `limit` and `foo`. An unknown name used to stop the value checks, so only `foo` was reported.
+
+#### Test 5: a body that is too large or not JSON
 
 ```java
   @Test
@@ -1162,7 +1409,7 @@ A single request with no key and three bad fields (`eventId` 0, `seat` `Z-9`, `c
 
 All three replies are judged by the contract too, because they go through `send`.
 
-#### Test 4: paging through events with the returned cursor
+#### Test 6: paging through events with the returned cursor
 
 ```java
   @Test
@@ -1183,7 +1430,7 @@ All three replies are judged by the contract too, because they go through `send`
 - `first.body().replaceAll(".*\"nextCursor\":\"([^\"]+)\".*", "$1")` cuts the cursor out of the body with a regular expression. `.*` is "anything", the part in round brackets captures the text between the quotes after `nextCursor`, and `$1` is that capture.
 - The second request sends that cursor back. The first body contains events 1 and 2 and `nextCursor`; the last contains event 3 and no `nextCursor`. The small seed has three events, so two pages end it.
 
-#### Test 5: filters
+#### Test 7: filters
 
 ```java
   @Test
@@ -1203,7 +1450,7 @@ All three replies are judged by the contract too, because they go through `send`
 - `api.hold("B-3", "filter")` holds seat B-3. `?state=held` must list exactly that seat: the whole body is compared with `isEqualTo("{\"items\":[{\"seat\":\"B-3\",\"section\":\"B\",\"state\":\"held\"}]}")`.
 - `?section=C&limit=500` must list C-1 to C-20 and none of section B (`doesNotContain("\"B-")`).
 
-#### Test 6: a cursor belongs to one query
+#### Test 8: a cursor belongs to one query
 
 ```java
   @Test
@@ -1224,7 +1471,7 @@ All three replies are judged by the contract too, because they go through `send`
 
 A cursor made for `section=A` is reused with `section=B` and with another path (`/v1/events`). Both must be refused with `400`, and the first message must say `another event or filter`. A cursor that could be reused on any query would let a client skip or repeat rows.
 
-#### Test 7: unknown ids
+#### Test 9: unknown ids
 
 ```java
   @Test
@@ -1245,7 +1492,7 @@ A cursor made for `section=A` is reused with `section=B` and with another path (
 
 An unknown event (`999`), hold (a UUID of all zeros), booking, a `DELETE` of an unknown hold, and holding a seat that does not exist (`Q-1`) must all answer `404`. Each reply is judged by the contract.
 
-#### Test 8: showing a hold and a booking, and cancelling twice
+#### Test 10: showing a hold and a booking, and cancelling twice
 
 ```java
   @Test
@@ -1280,7 +1527,7 @@ An unknown event (`999`), hold (a UUID of all zeros), booking, a `DELETE` of an 
 - A second hold on `A-6` is cancelled twice. Both `DELETE` calls answer `204` (no content): cancelling is **idempotent**, repeating it changes nothing. A `GET` then shows `"state":"cancelled"`.
 - The last assertion reads the database: the seat `A-6` is `AVAILABLE` again, exactly once (`SELECT COUNT(*) FROM seats WHERE seat_label = 'A-6' AND status = 'AVAILABLE'` is 1).
 
-#### Test 9: health and metrics
+#### Test 11: health and metrics
 
 ```java
   @Test
@@ -1341,7 +1588,7 @@ All ran in a scratch copy on 11 November 2026. Timings differ on every run.
 ./gradlew --offline cleanTest test --tests '*contract*'
 ```
 
-   Output: 18 `PASSED` lines (4 `BreakingChangeTest`, 9 `ContractConformanceTest`, 5 `OpenApiDocumentTest`).
+   Output: 23 `PASSED` lines (7 `BreakingChangeTest`, 11 `ContractConformanceTest`, 5 `OpenApiDocumentTest`).
 
 2. Lint all the contract files:
 

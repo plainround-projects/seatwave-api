@@ -167,6 +167,32 @@ class ContractConformanceTest {
   }
 
   @Test
+  void refusesANumberSentForTheCustomerAndHoldsNothing() throws Exception {
+    TestApi.Response reply =
+        api.send(
+            "POST",
+            "/v1/holds",
+            TestApi.jsonWithKey("number-customer"),
+            "{\"eventId\":1,\"seat\":\"A-1\",\"customer\":5}");
+
+    assertThat(reply.status()).isEqualTo(HttpStatus.BAD_REQUEST);
+    assertThat(reply.body())
+        .contains("{\"pointer\":\"/customer\",\"detail\":\"has the wrong type\"}");
+    assertThat(api.count("SELECT COUNT(*) FROM seats WHERE status = 'HELD'")).isZero();
+  }
+
+  @Test
+  void reportsAnUnknownParameterAndABadValueInOneProblem() throws Exception {
+    TestApi.Response reply = api.send("GET", "/v1/events?limit=0&foo=1", NO_HEADERS, "");
+
+    assertThat(reply.status()).isEqualTo(HttpStatus.BAD_REQUEST);
+    assertThat(reply.body())
+        .contains("\"detail\":\"2 fields are invalid\"")
+        .contains("\"pointer\":\"limit\"")
+        .contains("\"pointer\":\"foo\"");
+  }
+
+  @Test
   void refusesABodyThatIsTooLargeOrNotJson() throws Exception {
     TestApi.Response tooLarge =
         api.send(

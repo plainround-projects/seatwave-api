@@ -21,6 +21,7 @@ The lesson of Module 7 depends on a database that can say "no" reliably. The rul
 | `src/main/resources/db/migration/V1__module_1_schema.sql` | Module 1's three tables and one index. |
 | `src/main/resources/db/migration/V2__idempotency_and_payment.sql` | The key table, the lease column, the status check, the payment columns of `bookings`. |
 | `src/main/resources/db/migration/V3__seat_order_for_cursors.sql` | The numeric seat order and two indexes for cursor paging. |
+| `src/main/resources/db/migration/V4__seats_by_hold.sql` | The index that finds a seat by its hold id. |
 | `src/main/resources/logback.xml` | Not SQL: the log format. |
 | `store/Database.java` | Opens H2 and runs the migrations at start-up. |
 | `booking/SeatLedger.java`, `idempotency/IdempotencyStore.java`, `catalog/CatalogService.java` | The statements the program sends. |
@@ -54,7 +55,7 @@ H2 writes the names of unquoted tables and columns in upper case internally (`SE
 - A **constraint name** (`CONSTRAINT one_booking_per_seat ...`) shows up in the error message, so a failure is easy to read.
 - An **index** is a sorted copy of some columns that lets the database find rows without reading the whole table. A primary key and a unique constraint each make an index. Without a suitable index, a `WHERE` that names other columns makes the database scan every row.
 
-The database reports a broken rule with an **SQLSTATE**: a five-character code. `23505` is a unique or primary key violation. `23513` is a check constraint violation. I ran the three migrations on H2 2.5.252 and tried to break each rule; the database answered:
+The database reports a broken rule with an **SQLSTATE**: a five-character code. `23505` is a unique or primary key violation. `23513` is a check constraint violation. I ran the first three migrations on H2 2.5.252 and tried to break each rule; the database answered:
 
 ```text
 same key twice: refused, SQLState 23505, Unique index or primary key violation: PUBLIC.ONE_EFFECT_PER_KEY
@@ -104,15 +105,17 @@ The same mechanism sorts out a race for a primary key. Two transactions insert t
 
 ### Migrations
 
-A migration is a numbered SQL file. The names are `V1__module_1_schema.sql`, `V2__idempotency_and_payment.sql`, `V3__seat_order_for_cursors.sql`: the letter V, a version number, two underscores, a description.
+A migration is a numbered SQL file. The names are `V1__module_1_schema.sql`, `V2__idempotency_and_payment.sql`, `V3__seat_order_for_cursors.sql`, `V4__seats_by_hold.sql`: the letter V, a version number, two underscores, a description.
 
-**How they run at start-up.** `SeatWaveApi.start` calls `Database.open(url)`, which calls `migrate`. `migrate` creates the table `schema_history` (version number and script name) if it does not exist, then goes through the list of three file names. For each one, if its version is already in `schema_history`, it skips it; if not, it runs the file with the H2 command `RUNSCRIPT FROM 'classpath:/db/migration/<name>'` and records the version. I ran this on a fresh file database and on the same file again: the first run applied all three, the second skipped all three, and `schema_history` held the same three rows. A fresh database ends with five tables in the `PUBLIC` schema: `events`, `seats`, `bookings`, `idempotency_keys` and `schema_history`.
+**How they run at start-up.** `SeatWaveApi.start` calls `Database.open(url)`, which calls `migrate`. `migrate` creates the table `schema_history` (version number and script name) if it does not exist, then goes through the list of four file names. For each one, if its version is already in `schema_history`, it skips it; if not, it runs the file with the H2 command `RUNSCRIPT FROM 'classpath:/db/migration/<name>'` and records the version. `DatabaseTest` runs this on a fresh file database and on the same file again: the first run applies all four, the second skips all four, and `schema_history` holds the same four rows.
 
-**Why migrations only add.** The rule in `Database.java` is "A new migration is appended, never edited after release." Two reasons.
-1. A database that already ran version 2 will never run version 2 again. If you edit the file, new databases and old databases silently become different.
+**Why every statement can run twice.** Running a script and recording it are two separate commits, because H2 commits a schema statement the moment it runs. A crash between the two leaves the schema changed and the history without its row, so the next start runs the script again. Every statement is therefore written so that a second run does nothing: `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` and `ADD CONSTRAINT IF NOT EXISTS` skip what is already there, and V3's `UPDATE` writes the same values again. Without `IF NOT EXISTS`, the second run stopped at the first statement with `Table "EVENTS" already exists` and the program could not start. The same property covers a crash in the middle of a script. A fresh database ends with five tables in the `PUBLIC` schema: `events`, `seats`, `bookings`, `idempotency_keys` and `schema_history`.
+
+**Why migrations only add.** The rule in `Database.java` is that a new migration is appended, and a released one is never changed in what it creates. Two reasons.
+1. A database that already ran version 2 will never run version 2 again. If you change what the file creates, new databases and old databases silently become different. (Adding `IF NOT EXISTS` was allowed for that reason: it changes no object the file creates, only whether a second run fails.)
 2. While a new version of the program rolls out, the old version is still running against the same database. A change that only **adds** (a new table, a new nullable column, a new index) leaves the old program working. A change that removes or renames a column breaks it at once. The safe order is called **expand and contract**: first add the new shape (expand), move the data, switch the program over, and only much later remove the old shape (contract). The comments in V2 and V3 say "Expand only" and "expand and migrate". This repository has no contract step: nothing is ever dropped.
 
-**What a migration can and cannot undo.** The migration folder has no "down" scripts. To undo a mistake you write version 4. H2 runs a schema change as soon as it is sent, outside any rollback, so a script that stops half way leaves half the changes.
+**What a migration can and cannot undo.** The migration folder has no "down" scripts. To undo a mistake you write the next version, here version 5. H2 runs a schema change as soon as it is sent, outside any rollback, so a script that stops half way leaves half the changes; because every statement can run twice, the next start finishes the rest.
 
 ## Walkthrough of this repository's use
 
@@ -120,7 +123,7 @@ A migration is a numbered SQL file. The names are `V1__module_1_schema.sql`, `V2
 
 ```sql
 -- Module 1's three tables, unchanged: the API in front of them changes, the rule inside them does not.
-CREATE TABLE events (
+CREATE TABLE IF NOT EXISTS events (
   event_id BIGINT PRIMARY KEY,
   name VARCHAR(120) NOT NULL,
   starts_at BIGINT NOT NULL
@@ -128,14 +131,14 @@ CREATE TABLE events (
 ```
 
 - Line 1 is a comment: SQL comments start with `--` and run to the end of the line. Module 1's three tables arrive unchanged. The API in front of them changes, the rule inside does not.
-- `CREATE TABLE events (...)` makes a table. The column list is in parentheses, separated by commas.
+- `CREATE TABLE IF NOT EXISTS events (...)` makes a table. The column list is in parentheses, separated by commas. `IF NOT EXISTS` makes the statement do nothing when the table is already there, so the file can run a second time after a crash (see "Why every statement can run twice").
 - `event_id BIGINT PRIMARY KEY` makes the id a whole number that identifies the row.
 - `name VARCHAR(120) NOT NULL` is the event name, at most 120 characters, always present.
 - `starts_at BIGINT NOT NULL` is the start time as epoch milliseconds.
 
 ```sql
 -- The status column is the single source of truth for a seat. Java never decides alone.
-CREATE TABLE seats (
+CREATE TABLE IF NOT EXISTS seats (
   event_id BIGINT NOT NULL,
   seat_label VARCHAR(16) NOT NULL,
   section VARCHAR(4) NOT NULL,
@@ -157,7 +160,7 @@ CREATE TABLE seats (
 
 ```sql
 -- Second guard: even a bug in the confirm logic cannot create two bookings for one seat.
-CREATE TABLE bookings (
+CREATE TABLE IF NOT EXISTS bookings (
   booking_id VARCHAR(40) PRIMARY KEY,
   event_id BIGINT NOT NULL,
   seat_label VARCHAR(16) NOT NULL,
@@ -166,13 +169,13 @@ CREATE TABLE bookings (
   CONSTRAINT one_booking_per_seat UNIQUE (event_id, seat_label)
 );
 
-CREATE INDEX seats_by_section ON seats (event_id, section);
+CREATE INDEX IF NOT EXISTS seats_by_section ON seats (event_id, section);
 ```
 
 - The comment: this is the second guard. Even a bug in the confirm logic cannot create two bookings for one seat.
 - `bookings` has one row per paid seat: id, event, seat label, customer, and the confirm time.
 - `CONSTRAINT one_booking_per_seat UNIQUE (event_id, seat_label)` refuses a second row with the same event and seat. The test above showed `UNIQUE ... ONE_BOOKING_PER_SEAT` refusing a second booking.
-- `CREATE INDEX seats_by_section ON seats (event_id, section)` makes an index to find the seats of one section of one event quickly (Module 1's seat list).
+- `CREATE INDEX IF NOT EXISTS seats_by_section ON seats (event_id, section)` makes an index to find the seats of one section of one event quickly (Module 1's seat list).
 
 ### `V2__idempotency_and_payment.sql`
 
@@ -188,7 +191,7 @@ CREATE INDEX seats_by_section ON seats (event_id, section);
 - Lines 4 and 5 are the comment of the key table: the primary key is the invariant (one key, at most one effect) and the key row is written in the same transaction as the effect.
 
 ```sql
-CREATE TABLE idempotency_keys (
+CREATE TABLE IF NOT EXISTS idempotency_keys (
   endpoint VARCHAR(32) NOT NULL,
   idempotency_key VARCHAR(64) NOT NULL,
   fingerprint CHAR(64) NOT NULL,
@@ -205,7 +208,7 @@ CREATE TABLE idempotency_keys (
 );
 ```
 
-- `CREATE TABLE idempotency_keys (...)`: one row per `(endpoint, key)`.
+- `CREATE TABLE IF NOT EXISTS idempotency_keys (...)`: one row per `(endpoint, key)`.
 - `endpoint VARCHAR(32) NOT NULL` holds `POST /v1/holds` or `POST /v1/bookings`.
 - `idempotency_key VARCHAR(64) NOT NULL` is the client's key (1 to 64 characters, the same limit as the contract).
 - `fingerprint CHAR(64) NOT NULL` is the SHA-256 digest of the request in hexadecimal: exactly 64 characters.
@@ -218,7 +221,7 @@ CREATE TABLE idempotency_keys (
 
 ```sql
 -- The purge deletes by expiry; without this index it would scan every key.
-CREATE INDEX idempotency_keys_by_expiry ON idempotency_keys (expires_at);
+CREATE INDEX IF NOT EXISTS idempotency_keys_by_expiry ON idempotency_keys (expires_at);
 ```
 
 - The purge deletes by expiry. Without the index `idempotency_keys_by_expiry` on `expires_at`, `DELETE ... WHERE expires_at <= ?` would scan every key. With 100,000 keys the README measures 233 bytes per stored key, table and indexes together.
@@ -226,21 +229,21 @@ CREATE INDEX idempotency_keys_by_expiry ON idempotency_keys (expires_at);
 ```sql
 -- While a confirm waits for the payment provider, the seat is CONFIRMING until this time.
 -- After it, another attempt may take over; the provider's own key stops a second charge.
-ALTER TABLE seats ADD COLUMN confirm_lease_until BIGINT;
+ALTER TABLE seats ADD COLUMN IF NOT EXISTS confirm_lease_until BIGINT;
 
-ALTER TABLE seats ADD CONSTRAINT known_seat_status
+ALTER TABLE seats ADD CONSTRAINT IF NOT EXISTS known_seat_status
   CHECK (status IN ('AVAILABLE', 'HELD', 'CONFIRMING', 'CONFIRMED'));
 ```
 
-- `ALTER TABLE seats ADD COLUMN confirm_lease_until BIGINT;` adds a column to an existing table. It is nullable, so existing rows get NULL and the old program does not care. The comments give its meaning: while a confirm waits for the payment provider, the seat is `CONFIRMING` until this time. After it, another attempt may take over, and the provider's own key stops a second charge.
-- `ALTER TABLE seats ADD CONSTRAINT known_seat_status CHECK (status IN ('AVAILABLE', 'HELD', 'CONFIRMING', 'CONFIRMED'))` makes the database refuse any other status. Before V2 the program alone guarded the words. The check also makes the `IllegalStateException` in `SeatLedger.stateOf` unreachable.
+- `ALTER TABLE seats ADD COLUMN IF NOT EXISTS confirm_lease_until BIGINT;` adds a column to an existing table, unless a column of that name is already there. It is nullable, so existing rows get NULL and the old program does not care. The comments give its meaning: while a confirm waits for the payment provider, the seat is `CONFIRMING` until this time. After it, another attempt may take over, and the provider's own key stops a second charge.
+- `ALTER TABLE seats ADD CONSTRAINT IF NOT EXISTS known_seat_status CHECK (status IN ('AVAILABLE', 'HELD', 'CONFIRMING', 'CONFIRMED'))` makes the database refuse any other status. Before V2 the program alone guarded the words. The check also makes the `IllegalStateException` in `SeatLedger.stateOf` unreachable.
 
 ```sql
-ALTER TABLE bookings ADD COLUMN hold_id VARCHAR(40);
-ALTER TABLE bookings ADD COLUMN payment_id VARCHAR(64);
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS hold_id VARCHAR(40);
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_id VARCHAR(64);
 -- Money as an exact decimal, never a floating-point number.
-ALTER TABLE bookings ADD COLUMN amount DECIMAL(12, 2);
-ALTER TABLE bookings ADD COLUMN currency CHAR(3);
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS amount DECIMAL(12, 2);
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS currency CHAR(3);
 ```
 
 - Four columns are added to `bookings`: `hold_id VARCHAR(40)`, `payment_id VARCHAR(64)`, `amount DECIMAL(12, 2)` and `currency CHAR(3)`. All are nullable, because older rows have no payment (Module 1 booked without one).
@@ -252,11 +255,11 @@ ALTER TABLE bookings ADD COLUMN currency CHAR(3);
 -- Module 7: cursor pagination needs a stable, unique order that matches the seat map.
 -- seat_label sorts as text (A-1, A-10, A-100, A-2), so a numeric column is added and filled
 -- from the label (expand and migrate); new seats get it from the code that inserts them.
-ALTER TABLE seats ADD COLUMN seat_number INT;
+ALTER TABLE seats ADD COLUMN IF NOT EXISTS seat_number INT;
 ```
 
 - Cursor pagination (a page ends where the last seat the client saw ends) needs a stable, unique order that matches the seat map. The label cannot give it. As **text**, `A-1`, `A-10`, `A-100`, `A-2` sort in that order, because text sorts character by character. The seat map wants 1, 2, 3 ... 10. So a numeric column is added.
-- `ALTER TABLE seats ADD COLUMN seat_number INT;` adds it, nullable at first, so the statement works on a table that already has rows.
+- `ALTER TABLE seats ADD COLUMN IF NOT EXISTS seat_number INT;` adds it (or does nothing on a second run), nullable at first, so the statement works on a table that already has rows.
 
 ```sql
 UPDATE seats SET seat_number = CAST(SUBSTRING(seat_label, 3) AS INT);
@@ -272,14 +275,25 @@ ALTER TABLE seats ALTER COLUMN seat_number SET NOT NULL;
 
 ```sql
 -- The index the keyset query walks: equality on the event, then the order of the cursor.
-CREATE INDEX seats_in_map_order ON seats (event_id, section, seat_number);
+CREATE INDEX IF NOT EXISTS seats_in_map_order ON seats (event_id, section, seat_number);
 
 -- The event list is paged by start time, then id, so two events at one time keep an order.
-CREATE INDEX events_in_start_order ON events (starts_at, event_id);
+CREATE INDEX IF NOT EXISTS events_in_start_order ON events (starts_at, event_id);
 ```
 
-- `CREATE INDEX seats_in_map_order ON seats (event_id, section, seat_number)` is the index the keyset query walks: equality on the event, then the order of the cursor (section, then number). The next page is "the next rows after this position", found by the index, not by counting rows.
-- `CREATE INDEX events_in_start_order ON events (starts_at, event_id)` does the same for the event list, which is paged by start time and then id, so two events at one time keep a stable order.
+- `CREATE INDEX IF NOT EXISTS seats_in_map_order ON seats (event_id, section, seat_number)` is the index the keyset query walks: equality on the event, then the order of the cursor (section, then number). The next page is "the next rows after this position", found by the index, not by counting rows.
+- `CREATE INDEX IF NOT EXISTS events_in_start_order ON events (starts_at, event_id)` does the same for the event list, which is paged by start time and then id, so two events at one time keep a stable order.
+
+### `V4__seats_by_hold.sql`
+
+```sql
+-- Module 7: reading, confirming and cancelling a hold find its seat by hold_id. Without an index
+-- each of those queries scans every seat of every event.
+CREATE INDEX IF NOT EXISTS seats_by_hold ON seats (hold_id);
+```
+
+- Lines 1 and 2 are the comment: the queries that read, confirm and cancel a hold look for the seat by `hold_id` (`SeatLedger.findHold`, `leaseForConfirm`, `markConfirmed`, `cancel` and `releaseLease`), and without an index each of them reads every seat of every event.
+- `CREATE INDEX IF NOT EXISTS seats_by_hold ON seats (hold_id)` makes that index. The file does only this: it adds, so the program that ran before it still works. Most seats have no hold, so most entries hold `NULL`; an index on a nullable column is allowed and a lookup by a real hold id skips them. Try 3 below shows the plan before and after, and `DatabaseTest` fails if any of the five lookups goes back to a table scan.
 
 ### `src/main/resources/logback.xml`
 
@@ -319,7 +333,7 @@ This file is not SQL. It is in the same resources folder, and it is read by the 
 
 All commands run in a scratch copy of the repository or in a scratch folder. Output differs only in timings.
 
-**1. Break each rule on purpose.** Save this as `Rules.java` in a scratch folder. It runs the three migrations on an in-memory database and tries six statements that must be refused:
+**1. Break each rule on purpose.** Save this as `Rules.java` in a scratch folder. It runs the first three migrations (V4 only adds an index) on an in-memory database and tries six statements that must be refused:
 
 ```text
 import java.sql.*;
@@ -363,7 +377,7 @@ java -cp <path to h2-2.5.252.jar> Rules.java src/main/resources/db/migration
 
 The six output lines are the ones shown in "Keys, constraints and indexes" above.
 
-**2. Run the migrations through the repository's own class and read the history.** See Try 4 of `java-payment-and-store-walkthrough.md`: it prints the three rows of `schema_history`.
+**2. Run the migrations through the repository's own class and read the history.** See Try 4 of `java-payment-and-store-walkthrough.md`: it prints the rows of `schema_history`.
 
 **3. Ask the database how it will find a seat.** `EXPLAIN` shows the plan. Save this as `Plan.java` and run it with the compiled repository on the class path (`./gradlew compileJava processResources` first):
 
@@ -397,10 +411,10 @@ java -cp build/classes/java/main:build/resources/main:<path to h2-2.5.252.jar> P
 
 ```text
 SELECT "EVENT_ID" FROM "PUBLIC"."SEATS" /* PUBLIC.PRIMARY_KEY_76: EVENT_ID = CAST(1 AS BIGINT) AND SEAT_LABEL = 'A-7' */ WHERE ("EVENT_ID" = CAST(1 AS BIGINT)) AND ("SEAT_LABEL" = 'A-7')
-SELECT "EVENT_ID" FROM "PUBLIC"."SEATS" /* PUBLIC.SEATS.tableScan */ WHERE "HOLD_ID" = 'x'
+SELECT "EVENT_ID" FROM "PUBLIC"."SEATS" /* PUBLIC.SEATS_BY_HOLD: HOLD_ID = 'x' */ WHERE "HOLD_ID" = 'x'
 ```
 
-The first plan uses the primary key. The second says `tableScan`: there is no index on `hold_id`, so every lookup by hold id reads all 20,000 seats. In my run 1,000 such lookups took 480.5 ms (about 0.48 ms each) against 3.6 ms for 1,000 lookups by primary key. The plan number `76` in the first line changes between runs.
+The first plan uses the primary key. The second uses the index `seats_by_hold` from V4. Before V4 the second plan said `/* PUBLIC.SEATS.tableScan */`: every lookup by hold id read all 20,000 seats, and 1,000 such lookups took 480.5 ms against 3.6 ms for 1,000 lookups by primary key. With the index, in my run after a warm-up, 1,000 lookups by hold id took 3.5 ms and 1,000 by primary key 5.8 ms; timings differ on every run. The plan number `76` in the first line changes between runs.
 
 **4. Watch the migrations be skipped.** Run Try 4 of `java-payment-and-store-walkthrough.md` twice on the same file path. Nothing is applied the second time.
 
@@ -415,7 +429,7 @@ The first plan uses the primary key. The second says `tableScan`: there is no in
 - **Dropping or renaming a column in one step.** The old program still running against the database breaks at once. Add the new column, move the data, switch the program, and only later remove the old one.
 - **Storing money in a floating-point column.** Use `DECIMAL`.
 - **Comparing with `= NULL`.** It is never true. Use `IS NULL` and `IS NOT NULL`.
-- **Filtering on a column with no index.** The database scans every row. This repository has one example: `seats.hold_id` (Try 3 shows the plan).
+- **Filtering on a column with no index.** The database scans every row. This repository had one: `seats.hold_id`, until V4 added `seats_by_hold` (Try 3 shows the plan).
 - **Opening one file database from two programs.** The second fails.
 
 ## Check yourself
@@ -424,7 +438,7 @@ The first plan uses the primary key. The second says `tableScan`: there is no in
 2. What is the difference between a primary key and a unique constraint? (A primary key is the identity of the row and cannot be NULL; a table has one. A unique constraint only forbids duplicates; a table may have several. `one_booking_per_seat` is a unique constraint.)
 3. Why does V3 add the column first, fill it with `UPDATE`, and only then make it `NOT NULL`? (A `NOT NULL` column cannot be added to a table that has rows without giving them a value. Adding it nullable, filling it, then tightening it works on a table with data and a new empty table alike.)
 4. Why are the columns added by V2 nullable? (Old rows have no value for them, and the old program that does not know the columns must still be able to insert rows. This is the "expand only" rule.)
-5. What happens if `Database.open` runs on a database that already ran all three migrations? (Each version is found in `schema_history` and skipped. Nothing changes.)
+5. What happens if `Database.open` runs on a database that already ran all four migrations? (Each version is found in `schema_history` and skipped. Nothing changes. If a crash had lost a history row, the script runs again, changes nothing because of `IF NOT EXISTS`, and is recorded.)
 
 ## Further reading
 

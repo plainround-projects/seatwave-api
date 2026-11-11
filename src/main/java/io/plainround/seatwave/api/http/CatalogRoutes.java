@@ -46,9 +46,10 @@ final class CatalogRoutes {
 
   Reply listEvents(ApiRequest request) throws SQLException {
     List<FieldError> errors = new ArrayList<>();
-    Optional<Parameters> parameters = parameters(request, EVENT_PARAMETERS, errors);
-    Optional<Integer> limit = parameters.flatMap(found -> limitOf(found, errors));
-    Optional<Position> position = parameters.flatMap(found -> positionOf(found, errors));
+    // A bad name does not stop the value checks: every problem goes into one reply.
+    Parameters parameters = Parameters.read(request.rawQuery(), EVENT_PARAMETERS, errors);
+    Optional<Integer> limit = limitOf(parameters, errors);
+    Optional<Position> position = positionOf(parameters, errors);
     if (!errors.isEmpty()) {
       return problems.invalid(errors, request.correlationId());
     }
@@ -68,10 +69,10 @@ final class CatalogRoutes {
     if (!EVENT_ID.matcher(eventIdText).matches()) {
       errors.add(new FieldError("eventId", "must be a whole number of 1 or more"));
     }
-    Optional<Parameters> parameters = parameters(request, SEAT_PARAMETERS, errors);
-    Optional<SeatFilter> filter = parameters.flatMap(found -> filterOf(found, errors));
-    Optional<Integer> limit = parameters.flatMap(found -> limitOf(found, errors));
-    Optional<Position> position = parameters.flatMap(found -> positionOf(found, errors));
+    Parameters parameters = Parameters.read(request.rawQuery(), SEAT_PARAMETERS, errors);
+    Optional<SeatFilter> filter = filterOf(parameters, errors);
+    Optional<Integer> limit = limitOf(parameters, errors);
+    Optional<Position> position = positionOf(parameters, errors);
     if (!errors.isEmpty()) {
       return problems.invalid(errors, request.correlationId());
     }
@@ -95,17 +96,6 @@ final class CatalogRoutes {
           problems.reply(ProblemType.NOT_FOUND, "no event has this id", request.correlationId());
       case CatalogProblem.BadCursor(String detail) ->
           problems.invalid(List.of(new FieldError("cursor", detail)), request.correlationId());
-    };
-  }
-
-  private static Optional<Parameters> parameters(
-      ApiRequest request, Set<String> allowed, List<FieldError> errors) {
-    return switch (Parameters.parse(request.rawQuery(), allowed)) {
-      case Result.Success<Parameters, List<FieldError>>(Parameters found) -> Optional.of(found);
-      case Result.Error<Parameters, List<FieldError>>(List<FieldError> bad) -> {
-        errors.addAll(bad);
-        yield Optional.empty();
-      }
     };
   }
 

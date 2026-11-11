@@ -98,33 +98,41 @@ public record ApiSettings(
                 // A missing or invalid URL is already a problem line; this stand-in only lets the
                 // reading go on, so every other problem is reported in the same run.
                 .transform(text -> text.isEmpty() ? "http://127.0.0.1:1" : text));
+    int problemsBeforeTimes = reader.problems().size();
     Duration connect = reader.millisBetween("payment.connectTimeoutMillis", 1, MAX_TIMEOUT_MILLIS);
     Duration request = reader.millisBetween("payment.requestTimeoutMillis", 1, MAX_TIMEOUT_MILLIS);
     Duration lease = reader.millisBetween("payment.leaseMillis", 1, MAX_TIMEOUT_MILLIS);
+    // A rule between keys is checked only when each key was valid alone, so a stand-in value
+    // never produces a second, misleading problem line.
+    if (reader.problems().size() == problemsBeforeTimes
+        && !Payment.isLeaseLongEnough(connect, request, lease)) {
+      reader.reject(Payment.LEASE_TOO_SHORT);
+    }
     BigDecimal price = reader.amount("booking.seatPrice");
     String currency = reader.matching("booking.currency", CURRENCY, "three capital letters");
     int retryAfterSeconds = reader.intBetween("http.retryAfterSeconds", 1, MAX_RETRY_AFTER_SECONDS);
+    int problemsBeforeDates = reader.problems().size();
     Instant deprecatedAt = reader.instant("version0.deprecatedAt");
     Instant sunsetAt = reader.instant("version0.sunsetAt");
+    if (reader.problems().size() == problemsBeforeDates
+        && !Version0.isSunsetAfterDeprecation(deprecatedAt, sunsetAt)) {
+      reader.reject(Version0.SUNSET_TOO_EARLY);
+    }
     if (!reader.problems().isEmpty()) {
       return Result.error(reader.problems());
     }
-    try {
-      return Result.success(
-          new ApiSettings(
-              port,
-              inFlight,
-              url,
-              seed,
-              new Payment(paymentUrl, connect, request, lease),
-              price,
-              currency,
-              Duration.ofSeconds(retryAfterSeconds),
-              new Version0(deprecatedAt, sunsetAt)));
-    } catch (IllegalArgumentException crossFieldProblem) {
-      // Each key was valid alone; a rule between two keys failed (for example the lease).
-      return Result.error(List.of(crossFieldProblem.getMessage()));
-    }
+    // Every rule the constructors check was checked above, so these cannot throw.
+    return Result.success(
+        new ApiSettings(
+            port,
+            inFlight,
+            url,
+            seed,
+            new Payment(paymentUrl, connect, request, lease),
+            price,
+            currency,
+            Duration.ofSeconds(retryAfterSeconds),
+            new Version0(deprecatedAt, sunsetAt)));
   }
 
   /**
@@ -162,7 +170,10 @@ public record ApiSettings(
   public record Payment(
       URI baseUrl, Duration connectTimeout, Duration requestTimeout, Duration lease) {
 
-    /** Checks the fields. */
+    static final String LEASE_TOO_SHORT =
+        "payment.leaseMillis must be longer than the connect and request timeouts together";
+
+    /** Checks the fields; the lease rule stays here as the last line of defence. */
     public Payment {
       Objects.requireNonNull(baseUrl, "baseUrl");
       if (!LOOPBACK_URL.matcher(baseUrl.toString()).matches()) {
@@ -171,12 +182,16 @@ public record ApiSettings(
       Objects.requireNonNull(connectTimeout, "connectTimeout");
       Objects.requireNonNull(requestTimeout, "requestTimeout");
       Objects.requireNonNull(lease, "lease");
+      if (!isLeaseLongEnough(connectTimeout, requestTimeout, lease)) {
+        throw new IllegalArgumentException(LEASE_TOO_SHORT);
+      }
+    }
+
+    static boolean isLeaseLongEnough(
+        Duration connectTimeout, Duration requestTimeout, Duration lease) {
       // A lease shorter than the call would let a second confirm take the seat over while the
       // first is still waiting for the provider.
-      if (lease.compareTo(connectTimeout.plus(requestTimeout)) <= 0) {
-        throw new IllegalArgumentException(
-            "payment.leaseMillis must be longer than the connect and request timeouts together");
-      }
+      return lease.compareTo(connectTimeout.plus(requestTimeout)) > 0;
     }
   }
 
@@ -188,13 +203,19 @@ public record ApiSettings(
    */
   public record Version0(Instant deprecatedAt, Instant sunsetAt) {
 
-    /** Checks the fields. */
+    static final String SUNSET_TOO_EARLY = "version0.sunsetAt must be after version0.deprecatedAt";
+
+    /** Checks the fields; the date rule stays here as the last line of defence. */
     public Version0 {
       Objects.requireNonNull(deprecatedAt, "deprecatedAt");
       Objects.requireNonNull(sunsetAt, "sunsetAt");
-      if (!sunsetAt.isAfter(deprecatedAt)) {
-        throw new IllegalArgumentException("version0.sunsetAt must be after version0.deprecatedAt");
+      if (!isSunsetAfterDeprecation(deprecatedAt, sunsetAt)) {
+        throw new IllegalArgumentException(SUNSET_TOO_EARLY);
       }
+    }
+
+    static boolean isSunsetAfterDeprecation(Instant deprecatedAt, Instant sunsetAt) {
+      return sunsetAt.isAfter(deprecatedAt);
     }
   }
 }

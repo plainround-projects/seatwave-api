@@ -365,17 +365,18 @@ When a `catch` rethrows the exact exception it caught, the compiler works out th
 `Objects.requireNonNull(value, "name")` throws a clear `NullPointerException` if the value is `null` and returns the value otherwise. The compact constructors use it to make sure that no field of a built object is `null`.
 
 ```java
-  /** Copies the headers and checks the fields. */
+  /** Copies the headers, keeping their order, and checks the fields. */
   public Reply {
     Objects.requireNonNull(contentType, "contentType");
     Objects.requireNonNull(body, "body");
-    headers = Map.copyOf(headers);
+    // Map.copyOf would lose the order; an unmodifiable copy of an ordered map keeps it.
+    headers = Collections.unmodifiableMap(new LinkedHashMap<>(headers));
   }
 ```
 
 ### Immutable collections and the newer list methods
 
-`List.of(...)`, `Map.of(...)` (Java 9), `List.copyOf(...)` and `Map.copyOf(...)` (Java 10) build collections that cannot be changed. `list.getFirst()` and `list.getLast()` (Java 21) read the ends of a list. Records copy their lists with these in the constructor, so a caller cannot change a built record from outside.
+`List.of(...)`, `Map.of(...)` (Java 9), `List.copyOf(...)` and `Map.copyOf(...)` (Java 10) build collections that cannot be changed. `list.getFirst()` and `list.getLast()` (Java 21) read the ends of a list. Records copy their lists with these in the constructor, so a caller cannot change a built record from outside. `Map.copyOf` keeps no order, so `Reply` above, whose headers keep the order they were added in, uses `Collections.unmodifiableMap(new LinkedHashMap<>(headers))` instead: an ordered copy behind a wrapper that refuses changes.
 
 ```java
   /** Copies the collections and checks the fields. */

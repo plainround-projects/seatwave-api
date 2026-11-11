@@ -1135,7 +1135,7 @@ The command ends with exit status 3, which Gradle reports as a failed task; its 
 ### `openapi/examples/holds-entry-broken.yaml` (Lab 1, the first draft)
 
 ```yaml
-# Lab 1: a first draft of the POST /v1/holds entry with three mistakes for lintContract to find.
+# Lab 1: a first draft of the POST /v1/holds entry with four mistakes for lintContract to find.
 openapi: 3.1.2
 info:
   title: SeatWave holds (Lab 1, first draft)
@@ -1158,7 +1158,7 @@ paths:
                   type: string
 ```
 
-- This is a complete, small OpenAPI document with a single operation: `POST /v1/holds`. The comment says it holds three mistakes for `lintContract` to find.
+- This is a complete, small OpenAPI document with a single operation: `POST /v1/holds`. The comment says it holds four mistakes for `lintContract` to find.
 - `info` has a `title` and a `version`. `paths` has one path with a `post`. It has an `operationId` but no `parameters` at all.
 - `requestBody` is required and has an **inline** schema (written in place, not by reference): an object with `required: [eventId, seat, customer]` but `properties` for only `eventId` and `seat`. `customer` is required and never defined, and `eventId` has no `format` or `minimum`.
 
@@ -1190,14 +1190,15 @@ components:
 I ran the linter on it:
 
 ```text
-openapi/examples/holds-entry-broken.yaml: 4 problem(s)
+openapi/examples/holds-entry-broken.yaml: 5 problem(s)
   parser: attribute paths.'/v1/holds'(post).responses.201.content.'application/json'.schema.#/components/schemas/Hold is missing
   parser: Could not find /components/schemas/Hold in contents of #/components/schemas/Hold
   rule: POST /v1/holds 409 must be application/problem+json Problem
   rule: POST /v1/holds creates something, so it must require Idempotency-Key
+  rule: POST /v1/holds request: required field customer is not defined
 ```
 
-The three mistakes are: the reference to a schema that does not exist (the parser reports it as two lines), the 409 that is not a problem details body, and the missing `Idempotency-Key`. The linter exits with status 3. Missing `customer` in `properties` is not found by the linter; it is a design fault you find by reading.
+The four mistakes are: the reference to a schema that does not exist (the parser reports it as two lines, so five lines in all), the 409 that is not a problem details body, the missing `Idempotency-Key`, and `customer`, which is required but never defined in `properties`. The parser accepts that last one, because a `required` name with no definition is valid OpenAPI; the house rule in `ContractRules` that every required field must be defined catches it. The linter exits with status 3.
 
 ### `openapi/examples/holds-entry.yaml` (Lab 1, the solution)
 
